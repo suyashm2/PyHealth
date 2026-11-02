@@ -50,6 +50,7 @@ from .mortality_prediction import (
     MultimodalMortalityPredictionMIMIC3,
     MultimodalMortalityPredictionMIMIC4,
 )
+from .next_visit_diagnosis import NextVisitDiagnosisMIMIC3, NextVisitDiagnosisMIMIC4
 from .survival_preprocess_support2 import SurvivalPreprocessSupport2
 from .mortality_prediction_stagenet_mimic4 import (
     MortalityPredictionStageNetMIMIC4,
