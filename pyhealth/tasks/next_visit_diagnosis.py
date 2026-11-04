@@ -90,11 +90,11 @@ class NextVisitDiagnosisMIMIC3(BaseTask):
 
     Attributes:
         task_name (str): The name of the task.
-        input_schema (dict[str, str]): The schema for input data:
-            - conditions: Diagnosis codes of each earlier visit (a list of
-              visits, each a list of codes).
-        output_schema (dict[str, str]): The schema for output data:
-            - next_conditions: Diagnosis codes of the target visit.
+        input_schema (dict[str, str]): The input field "conditions": the
+            diagnosis codes of each earlier visit (a list of visits, each a
+            list of codes).
+        output_schema (dict[str, str]): The output field "next_conditions":
+            the diagnosis codes of the target visit.
 
     Examples:
         >>> from pyhealth.datasets import MIMIC3Dataset
@@ -173,11 +173,11 @@ class NextVisitDiagnosisMIMIC4(BaseTask):
 
     Attributes:
         task_name (str): The name of the task.
-        input_schema (dict[str, str]): The schema for input data:
-            - conditions: ICD-9 diagnosis codes of each earlier visit (a list
-              of visits, each a list of codes).
-        output_schema (dict[str, str]): The schema for output data:
-            - next_conditions: ICD-9 diagnosis codes of the target visit.
+        input_schema (dict[str, str]): The input field "conditions": the
+            ICD-9 diagnosis codes of each earlier visit (a list of visits,
+            each a list of codes).
+        output_schema (dict[str, str]): The output field "next_conditions":
+            the ICD-9 diagnosis codes of the target visit.
 
     Examples:
         >>> from pyhealth.datasets import MIMIC4EHRDataset
