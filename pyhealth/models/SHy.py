@@ -1,135 +1,193 @@
-from typing import Dict, List, Optional, Tuple, Union
+"""A PyHealth 2.1 compatible SHy starting point for next-visit diagnosis prediction.
+
+The layer below implements visit-hypergraph message passing. It is an integration
+scaffold, not a complete reproduction of every SHy objective (phenotype sampling,
+false-negative completion, and explanation regularizers are not included).
+
+Example task sample before PyHealth converts codes to token IDs::
+
+    {
+        "patient_id": "P1",
+        "visit_id": "103",  # The visit being predicted; one ID, not visit history.
+        "conditions": [
+            ["4280", "25000"],  # Historical visit 1
+            ["V4581"],            # Historical visit 2
+        ],
+        "next_conditions": ["4280", "41401"],  # Diagnoses at the next visit
+    }
+
+After task processing and batching, ``forward`` receives numeric tensors. For a
+batch of two patients, the shapes may look like::
+
+    conditions:      [2, 2, 2]  # [patients, visits, code slots]
+    next_conditions: [2, 3]     # [patients, label-vocabulary entries]
+
+For example, the histories could be ``[[[2, 3], [4, 0]], [[5, 0], [0, 0]]]``.
+Here 0 is padding, 1 is the unknown-code token, and the numeric IDs for inputs
+and labels can come from separate vocabularies. The example IDs are illustrative;
+the fitted PyHealth processors assign the actual IDs for a dataset.
+"""
+from typing import Dict, Optional, Tuple
+
 import torch
 import torch.nn as nn
-from pyhealth.datasets import Dataset
+
+from pyhealth.datasets import SampleDataset
 from pyhealth.models import BaseModel
-from pyhealth.models.utils import get_embedding_module
+from pyhealth.models.embedding import EmbeddingModel
+
 
 class SHy(BaseModel):
-    """Self-Explaining Hypergraph Neural Network (SHy) for EHR prediction.
+    """Predict a multi-label next-visit outcome from nested diagnosis histories.
 
-    This model constructs hypergraphs from clinical encounters and applies 
-    higher-order hypergraph convolutions for clinical prediction. The goal 
-    is given hypergraph containing all the previous visits and diagnoses to 
-    predict the diagnoses at the next visit. """
+    Expected input feature shape: ``[batch, visits, codes_per_visit]``.
+    Token id 0 is padding. Labels are the processor's multi-hot target tensor,
+    e.g. ``kwargs['next_conditions']`` with shape ``[batch, label_vocab_size]``.
+    """
 
-    '''Example after processing the dataset class (contains all the relevant information we need)
-         Example:
-                {
-                    "patient_id": "10006",
-                    "visit_id": ["v_001", "v_002", "v_003"],
-                    "conditions": [
-                        ["4019", "25000"],  # Visit 1 codes
-                        ["25000", "4280"],   # Visit 2 codes
-                        ["4019"]             # Visit 3 codes
-                    ],
-                    "label": ["4280", "2765"] # The target codes to predict for the next visit
-                } 
-    '''
+    def __init__(self,dataset: SampleDataset, embedding_dim: int = 64, hidden_dim: Optional[int] = None,) -> None:
+        super().__init__(dataset=dataset)
+        if len(self.feature_keys) != 1:
+            raise ValueError("SHy currently expects exactly one nested code feature")
+        if len(self.label_keys) != 1:
+            raise ValueError("SHy currently expects exactly one label key")
+        self.feature_key = self.feature_keys[0]
+        self.label_key = self.label_keys[0]
+        self.mode = self.dataset.output_schema[self.label_key]
+        self.embedding_dim = embedding_dim
+        hidden_dim = hidden_dim or embedding_dim
 
-    def __init__(self, dataset: Dataset, feature_keys: List[str], label_key: str, mode: str, emb_size: int = 64, top_k_latent: int = 3) -> None:
-        super().__init__(
-            dataset=dataset, # Dataset object len(p) where p is number of patients and each element is a dict like example
-            feature_keys=feature_keys, # list of what columns in dataset to look at (i.e. co)
-            label_key=label_key, # what we want to predict
-            mode=mode, # multilabel for this model (next visit can have multiple conditions)
+        self.embedding_model = EmbeddingModel(dataset, embedding_dim)
+        self.num_nodes = self.dataset.input_processors[self.feature_key].size()
+        self.node_projection = nn.Linear(embedding_dim, hidden_dim)
+        self.visit_projection = nn.Linear(hidden_dim, hidden_dim)
+        self.activation = nn.ReLU()
+        self.classifier = nn.Linear(hidden_dim, self.get_output_size())
+
+    def _get_values_and_mask(self, value) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Unpack PyHealth's processor output, which may include a mask.
+
+        A typical batch arrives as a ``value`` tensor shaped ``[B, V, C]``:
+        patients, visits per patient, and code slots per visit. Some processors
+        return that tensor by itself; others return a tuple containing ``value``
+        and a padding ``mask``. This helper gives ``forward`` one consistent form.
+        """
+        if isinstance(value, torch.Tensor):
+            return value, None
+        schema = self.dataset.input_processors[self.feature_key].schema()
+        tensor_values = value[schema.index("value")]
+        mask = value[schema.index("mask")] if "mask" in schema else None
+        return tensor_values, mask
+
+    def construct_initial_hypergraph(
+        self, codes: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return patient-isolated incidence ``H`` and valid-visit mask.
+
+        ``H`` has shape ``[batch * num_nodes, batch * num_visits]``. Patient
+        blocks are disjoint, so shared code IDs cannot pass messages across
+        patients. Empty visits have no incident edges and are marked invalid.
+        """
+        if codes.dim() != 3:
+            raise ValueError(
+                f"Expected {self.feature_key} with shape [B,V,C], got {tuple(codes.shape)}"
+            )
+        codes = codes.long()
+        batch_size, num_visits, _ = codes.shape
+        device = codes.device
+        # Example: a visit [2, 3, 0] has two recorded codes and one padding slot.
+        # Zero is padding; IDs greater than zero (including unknown ID 1) count.
+        valid_codes = (codes > 0) & (codes < self.num_nodes)
+        valid_visits = valid_codes.any(dim=-1)
+
+        # Flatten patient/code rows and patient/visit columns into separate blocks.
+        # With B=2, patient 0 occupies the first num_nodes rows and patient 1 the
+        # next num_nodes rows. Their columns are divided the same way. This is the
+        # block-diagonal construction that prevents cross-patient messages.
+        H = torch.zeros(
+            batch_size * self.num_nodes,
+            batch_size * num_visits,
+            dtype=torch.float32,
+            device=device,
         )
-        self.emb_size = emb_size # how many numbers to represent each medical code
+        b_idx, v_idx, c_idx = valid_codes.nonzero(as_tuple=True)
+        if b_idx.numel():
+            # Each valid (patient, visit, code) occurrence sets one incidence to 1.
+            # A visit is a hyperedge; each code in it is one connected node.
+            rows = b_idx * self.num_nodes + codes[b_idx, v_idx, c_idx]
+            cols = b_idx * num_visits + v_idx
+            H[rows, cols] = 1.0
+        return H, valid_visits
 
-        # Standard embedding module (or your partner's hierarchical embedding module)
-        self.embedding_module = get_embedding_module(
-            feature_keys=self.feature_keys,
-            dataset=self.dataset,
-            emb_size=self.emb_size,
-        )
+    def forward(self, **kwargs) -> Dict[str, torch.Tensor]:
+        codes, processor_mask = self._get_values_and_mask(kwargs[self.feature_key])
+        codes = codes.to(self.device).long()
 
-        # Get the number of total diagnosis codes -- that will set up the number of rows in the incidence matrix
-        self.num_nodes = self.dataset.get_vocab_size(self.feature_keys[0]) 
+        # 2) Convert those histories into H, the patient-specific visit/code map.
+        # valid_visits remembers which visit slots actually contain a code.
+        H, valid_visits = self.construct_initial_hypergraph(codes)
+        batch_size, num_visits, codes_per_visit = codes.shape
 
-        # Final classification head and loss function
-        self.fc = nn.Linear(self.emb_size, self.get_output_size())
-        self.loss_function = self.get_loss_function()
+        # 3) PyHealth's embedding layer turns every input code ID into a D-vector.
+        # The processor mask, when supplied, is forwarded in its expected format.
+        masks = {}
+        if processor_mask is not None:
+            processor_mask = processor_mask.to(self.device)
+            masks[self.feature_key] = processor_mask
+        embedded = self.embedding_model(
+            {self.feature_key: codes}, masks=masks
+        )[self.feature_key]
+        if embedded.dim() != 4:
+            raise ValueError(
+                "SHy expects EmbeddingModel output [B,V,C,D] for a nested code feature; "
+                f"got {tuple(embedded.shape)}"
+            )
 
-    def construct_initial_hypergraph(self, patient_batch: Dict[str, torch.Tensor],device: torch.device,) -> Tuple[torch.Tensor, int]:
-        """Constructs the initial hypergraph incidence matrix H for a batch of patients."""
-        feature_key = self.feature_keys[0] # which column from dataset we want
-        sequences = patient_batch[feature_key]  # [batch_size, num_visits, num_diagnoses]
+        # 4) Pool code occurrences into node features, separately for each patient.
+        # If a code appears in multiple visits, average its embeddings for that
+        # patient's node. Padding and invalid IDs contribute nothing. The same
+        # diagnosis in two patients gets two separate rows due to patient_node_ids.
+        valid = (codes > 0) & (codes < self.num_nodes)
+        flat_patient = torch.arange(batch_size, device=self.device)[:, None, None]
+        patient_node_ids = flat_patient * self.num_nodes + codes.clamp(0, self.num_nodes - 1)
+        x = embedded.new_zeros((batch_size * self.num_nodes, self.embedding_dim))
+        counts = embedded.new_zeros((batch_size * self.num_nodes, 1))
+        if valid.any():
+            flat_ids = patient_node_ids[valid]
+            x.index_add_(0, flat_ids, embedded[valid])
+            counts.index_add_(0, flat_ids, embedded.new_ones((flat_ids.numel(), 1)))
+        x = x / counts.clamp_min(1.0)
+        x = self.activation(self.node_projection(x))
 
-        row_indices = []
-        col_indices = []
-        total_hyperedges = 0
+        # 5) Send information code -> visit -> code using H. Dividing by degrees
+        # averages the connected nodes/visits instead of letting large visits or
+        # frequently repeated nodes dominate just because they have more links.
+        edge_degree = H.sum(dim=0).clamp_min(1.0)
+        node_degree = H.sum(dim=1).clamp_min(1.0)
+        visit_repr = (H.transpose(0, 1) @ x) / edge_degree.unsqueeze(1)
+        visit_repr = self.activation(self.visit_projection(visit_repr))
+        node_repr = (H @ visit_repr) / node_degree.unsqueeze(1)
+        visit_repr = (H.transpose(0, 1) @ node_repr) / edge_degree.unsqueeze(1)
+        visit_repr = visit_repr.view(batch_size, num_visits, -1)
 
-        for patient_visits in sequences: # extracts one patient's set of visits and medical codes
-            '''
-            Example: 
-            [
-                [code 1, code 2] # visit 1
-                ,[code 3] # visit 4
-            ]
-            '''
-            for visit_codes in patient_visits: # extracts one visit and the set of codes 
-                '''
-                Example:
-                [code 1, code 2] # visit 1
-                '''
-                hyperedge_idx = total_hyperedges # counts the visit number for column initialization
-                total_hyperedges += 1
-                
-                for code_idx in visit_codes:
-                    if code_idx < self.num_nodes:
-                        row_indices.append(code_idx) # represents each diagnosis code
-                        col_indices.append(hyperedge_idx) # represents the visit number
+        # 6) Fold each patient's visit vectors into one patient vector. Empty padded
+        # visits are masked out. The clamp makes a completely empty history produce
+        # zeros rather than a divide-by-zero/NaN.
+        visit_weights = valid_visits.to(visit_repr.dtype).unsqueeze(-1)
+        patient_repr = (visit_repr * visit_weights).sum(dim=1)
+        patient_repr = patient_repr / visit_weights.sum(dim=1).clamp_min(1.0)
+        logits = self.classifier(patient_repr)
 
-        # edge case where there are 0 visits return one visit all with 0s
-        if total_hyperedges == 0:
-            return torch.zeros((self.num_nodes, 1), device=device), 1
-
-        indices = torch.tensor([row_indices, col_indices], dtype=torch.long, device=device) # row 0 = diagnosis code, row 1 = visit indicies (for sparse index processing)
-        values = torch.ones(len(row_indices), dtype=torch.float32, device=device)
-
-        # has all diagnosis codes and different patient visits concatanated side by side 
-        H = torch.sparse_coo_tensor(
-            indices, values, size=(self.num_nodes, total_hyperedges)
-        ).to_dense()
-
-        return H, total_hyperedges
-
-
-    def forward(self,patient_batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """Forward pass for the SHy model."""
-        device = self.fc.weight.device
-
-        # 1. Obtain node embeddings (X) : for encoding the diagnosis -- the row is the diagnosis, column is embeddings size
-        embeddings = self.embedding_module(patient_batch)   # embeddings for each diagnosis
-        if isinstance(embeddings, dict):
-            X = embeddings[self.feature_keys[0]]
-        else:
-            X = embeddings
-
-        # If X is batched [batch_size, seq_len, emb_size], we can pool or extract unique code embeddings.
-        # Let's flatten/collapse appropriately for graph convolution:
-        if X.dim() > 2:
-            X = X.reshape(-1, self.emb_size)
-        
-        # Ensure X matches vocabulary size if required by your convolution layers
-        if X.shape[0] != self.num_nodes:
-            # Padding or slicing fallback if shape differs
-            if X.shape[0] < self.num_nodes:
-                padding = torch.zeros((self.num_nodes - X.shape[0], self.emb_size), device=device)
-                X = torch.cat([X, padding], dim=0)
-            else:
-                X = X[:self.num_nodes, :]
-
-        # 2. Construct the initial hypergraph H for this batch and handle incompleteness (unrecorded conditions)
-        H, visit_len = self.construct_initial_hypergraph(patient_batch, device=device)
-
-        # 3. Next step: Pass X and H into your message passing (HGNN) layer!
-        # (We will wire up the message passing and phenotype extraction next)
-        patient_repr = torch.mean(X, dim=0, keepdim=True).expand(len(patient_batch['patient_id']), -1)
-        logits = self.fc(patient_repr)
-
-        # PyHealth mandatory return structure
-        y_true = self.prepare_y_true(patient_batch)
-        y_prob = self.prepare_y_prob(logits)
-        loss = self.loss_function(logits, y_true)
-
+        # 7) Each logit position corresponds to the label processor's vocabulary.
+        # Thus input IDs and label IDs may be numbered differently; the learned
+        # classifier connects the history representation to the target positions.
+        result = {"logit": logits, "y_prob": self.prepare_y_prob(logits)}
+        if self.label_key in kwargs:
+            # Training/evaluation batches include the multi-hot target, such as
+            # next_conditions. PyHealth's configured loss compares it to logits.
+            y_true = kwargs[self.label_key].to(self.device)
+            result["y_true"] = y_true
+            result["loss"] = self.get_loss_function()(logits, y_true)
+        if kwargs.get("embed", False):
+            result["embed"] = patient_repr
+        return result
