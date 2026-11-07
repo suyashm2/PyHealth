@@ -1,8 +1,10 @@
 """A PyHealth 2.1 compatible SHy starting point for next-visit diagnosis prediction.
 
-The layer below implements visit-hypergraph message passing. It is an integration
-scaffold, not a complete reproduction of every SHy objective (phenotype sampling,
-false-negative completion, and explanation regularizers are not included).
+The model builds hierarchy-aware initial code embeddings and applies a batched
+UniGIN-style code -> visit -> code message-passing step on patient-isolated
+hypergraphs. It is not yet a complete SHy reproduction: false-negative edge
+completion, temporal phenotype extraction, and the paper's explanation objectives
+are not implemented.
 
 Example task sample before PyHealth converts codes to token IDs::
 
@@ -22,56 +24,212 @@ batch of two patients, the shapes may look like::
     conditions:      [2, 2, 2]  # [patients, visits, code slots]
     next_conditions: [2, 3]     # [patients, label-vocabulary entries]
 
-For example, the histories could be ``[[[2, 3], [4, 0]], [[5, 0], [0, 0]]]``.
-Here 0 is padding, 1 is the unknown-code token, and the numeric IDs for inputs
-and labels can come from separate vocabularies. The example IDs are illustrative;
-the fitted PyHealth processors assign the actual IDs for a dataset.
+Input code IDs and label positions may use separate vocabularies. The hierarchy
+embedding rows are aligned to the fitted input vocabulary used by ``conditions``.
 """
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+import warnings
 
 import torch
 import torch.nn as nn
 
 from pyhealth.datasets import SampleDataset
+from pyhealth.medcode import InnerMap
 from pyhealth.models import BaseModel
-from pyhealth.models.embedding import EmbeddingModel
 
 
 class SHy(BaseModel):
-    """Predict a multi-label next-visit outcome from nested diagnosis histories.
+    """Predict multi-label next-visit diagnoses from nested diagnosis histories."""
 
-    Expected input feature shape: ``[batch, visits, codes_per_visit]``.
-    Token id 0 is padding. Labels are the processor's multi-hot target tensor,
-    e.g. ``kwargs['next_conditions']`` with shape ``[batch, label_vocab_size]``.
-    """
-
-    def __init__(self,dataset: SampleDataset, embedding_dim: int = 64, hidden_dim: Optional[int] = None,) -> None:
+    def __init__(
+        self,
+        dataset: SampleDataset,
+        embedding_dim: int = 64,
+        hidden_dim: Optional[int] = None,
+        num_hierarchy_levels: int = 4,
+        num_message_passing_layers: int = 2,
+    ) -> None:
         super().__init__(dataset=dataset)
         if len(self.feature_keys) != 1:
             raise ValueError("SHy currently expects exactly one nested code feature")
         if len(self.label_keys) != 1:
             raise ValueError("SHy currently expects exactly one label key")
+        if num_hierarchy_levels <= 0:
+            raise ValueError("num_hierarchy_levels must be positive")
+        if embedding_dim % num_hierarchy_levels != 0:
+            raise ValueError(
+                "embedding_dim must be divisible by num_hierarchy_levels so each "
+                "hierarchy level has the same embedding width"
+            )
+        if num_message_passing_layers <= 0:
+            raise ValueError("num_message_passing_layers must be positive")
+
         self.feature_key = self.feature_keys[0]
         self.label_key = self.label_keys[0]
         self.mode = self.dataset.output_schema[self.label_key]
         self.embedding_dim = embedding_dim
+        self.num_hierarchy_levels = num_hierarchy_levels
+        self.per_level_dim = embedding_dim // num_hierarchy_levels
         hidden_dim = hidden_dim or embedding_dim
 
-        self.embedding_model = EmbeddingModel(dataset, embedding_dim)
-        self.num_nodes = self.dataset.input_processors[self.feature_key].size()
-        self.node_projection = nn.Linear(embedding_dim, hidden_dim)
-        self.visit_projection = nn.Linear(hidden_dim, hidden_dim)
-        self.activation = nn.ReLU()
+        # ---------------------------------------------------------------------
+        # STEP 1 — Recover PyHealth's exact input-code <-> integer-ID mapping.
+        # 1a. Read the vocabulary fitted for the `conditions` input field.
+        # 1b. Invert it by ID, so row i in M will correspond to input token ID i.
+        # 1c. Read special-token IDs from the processor instead of guessing them.
+        # ---------------------------------------------------------------------
+        input_processor = self.dataset.input_processors[self.feature_key]
+        code_vocab = getattr(input_processor, "code_vocab", None)
+        if not isinstance(code_vocab, dict) or not code_vocab:
+            raise TypeError(
+                "SHy needs the fitted input processor's `code_vocab` mapping "
+                "(diagnosis token -> integer ID) to align M with H"
+            )
+        self.num_nodes = input_processor.size()
+        id_to_token: List[Optional[str]] = [None] * self.num_nodes
+        for token, token_id in code_vocab.items():
+            token_id = int(token_id)
+            if not 0 <= token_id < self.num_nodes:
+                raise ValueError(f"Input token ID {token_id} is outside processor size")
+            if id_to_token[token_id] is not None:
+                raise ValueError(f"Two input tokens map to ID {token_id}")
+            id_to_token[token_id] = str(token)
+        if any(token is None for token in id_to_token):
+            raise ValueError("Input processor vocabulary IDs must be contiguous from 0")
+        self.id_to_code = tuple(id_to_token)
+        self.pad_idx = int(code_vocab.get("<pad>", 0))
+        self.unk_idx = int(code_vocab.get("<unk>", 1))
+
+        # ---------------------------------------------------------------------
+        # STEP 2 — Resolve every input diagnosis to a fixed-width ICD-9 path.
+        # 2a. Standardize strings such as "4280" to the hierarchy's "428.0".
+        # 2b. Ask PyHealth's ICD9CM map for the code's ancestors.
+        # 2c. Drop ICD-9's universal root, keep the most-specific levels when a
+        #     path exceeds L, and add code-specific virtual children when shorter.
+        # 2d. Assign a level-local integer ID to every hierarchy node. Special
+        #     tokens get their own IDs and will be masked from graph operations.
+        # ---------------------------------------------------------------------
+        icd9cm = InnerMap.load("ICD9CM")
+        code_level_node_ids, level_vocab_sizes, unmapped = self._make_level_node_ids(
+            self.id_to_code, icd9cm, num_hierarchy_levels
+        )
+        if unmapped:
+            warnings.warn(
+                f"{len(unmapped)} input tokens were not found in the ICD-9-CM "
+                "hierarchy. They receive code-specific virtual hierarchy nodes.",
+                stacklevel=2,
+            )
+        self.register_buffer("code_level_node_ids", code_level_node_ids)
+
+        # ---------------------------------------------------------------------
+        # STEP 3 — Create the learnable hierarchy tables and assemble initial M.
+        # 3a. Each level gets its own learnable embedding table, shared by codes
+        #     that have the same ontology node at that level.
+        # 3b. _initial_code_embeddings() looks up one vector per level and
+        #     concatenates them, yielding M with shape [input codes, embedding_dim].
+        # ---------------------------------------------------------------------
+        self.hierarchy_embeddings = nn.ModuleList(
+            [nn.Embedding(size, self.per_level_dim) for size in level_vocab_sizes]
+        )
+        for table in self.hierarchy_embeddings:
+            nn.init.normal_(table.weight, mean=0.0, std=0.02)
+
+        # ---------------------------------------------------------------------
+        # STEP 4 — Set up patient-specific UniGIN-style message passing.
+        # 4a. H chooses which code rows contribute to each visit.
+        # 4b. Each layer averages code vectors into visits, then sums those visit
+        #     vectors back into codes while retaining each code's own state.
+        # 4c. Parameters are shared across patients; batched H keeps their data
+        #     and updated code states separate.
+        # ---------------------------------------------------------------------
+        self.message_layers = nn.ModuleList(
+            [nn.Linear(embedding_dim, embedding_dim) for _ in range(num_message_passing_layers)]
+        )
+        self.message_eps = nn.ParameterList(
+            [nn.Parameter(torch.zeros(())) for _ in range(num_message_passing_layers)]
+        )
+        self.message_activation = nn.LeakyReLU()
+
+        # The paper's temporal phenotype predictor is not implemented yet. This
+        # pooling/classifier head is a temporary downstream prediction scaffold.
+        self.patient_projection = nn.Linear(embedding_dim, hidden_dim)
+        self.patient_activation = nn.ReLU()
         self.classifier = nn.Linear(hidden_dim, self.get_output_size())
 
-    def _get_values_and_mask(self, value) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Unpack PyHealth's processor output, which may include a mask.
+    @staticmethod
+    def _make_level_node_ids(
+        id_to_code: Sequence[Optional[str]], icd9cm: Any, num_levels: int
+    ) -> Tuple[torch.Tensor, List[int], List[str]]:
+        """Map each processor ID to one hierarchy-node ID at every level."""
+        level_vocabularies: List[Dict[str, int]] = [dict() for _ in range(num_levels)]
+        rows: List[List[int]] = []
+        unmapped: List[str] = []
+        special_tokens = {"<pad>", "<unk>"}
 
-        A typical batch arrives as a ``value`` tensor shaped ``[B, V, C]``:
-        patients, visits per patient, and code slots per visit. Some processors
-        return that tensor by itself; others return a tuple containing ``value``
-        and a padding ``mask``. This helper gives ``forward`` one consistent form.
-        """
+        for raw_token in id_to_code:
+            token = str(raw_token)
+            if token in special_tokens:
+                # Special rows remain well-defined but are excluded by the code mask.
+                path = [f"__special__:{token}:level:{level}" for level in range(num_levels)]
+            else:
+                standardized = icd9cm.standardize(token)
+                try:
+                    # PyHealth returns ancestors nearest-first; reverse to root-first.
+                    ancestors = list(icd9cm.get_ancestors(standardized))
+                    path = list(reversed(ancestors)) + [standardized]
+                    # ICD9CM includes its universal 001-999.99 root in paths.
+                    # SHy's four disease levels start below that dataset-wide root.
+                    if path and path[0] == "001-999.99":
+                        path = path[1:]
+                except (KeyError, ValueError):
+                    # Preserve an embedding for a token absent from the ontology.
+                    path = [standardized]
+                    unmapped.append(token)
+
+                if len(path) > num_levels:
+                    # Keep the most-specific levels, including the diagnosis itself.
+                    path = path[-num_levels:]
+                elif len(path) < num_levels:
+                    # A code may be a non-leaf or have no known ancestors. Add
+                    # code-specific virtual descendants so every row has L levels.
+                    path.extend(
+                        f"__virtual_child__:{standardized}:{depth}"
+                        for depth in range(num_levels - len(path))
+                    )
+
+            row_ids = []
+            for level, hierarchy_node in enumerate(path):
+                level_vocab = level_vocabularies[level]
+                if hierarchy_node not in level_vocab:
+                    level_vocab[hierarchy_node] = len(level_vocab)
+                row_ids.append(level_vocab[hierarchy_node])
+            rows.append(row_ids)
+
+        return (
+            torch.tensor(rows, dtype=torch.long),
+            [len(vocab) for vocab in level_vocabularies],
+            unmapped,
+        )
+
+    def _initial_code_embeddings(self) -> torch.Tensor:
+        """Build learnable M by concatenating each code's level embeddings."""
+        level_vectors = [
+            table(self.code_level_node_ids[:, level])
+            for level, table in enumerate(self.hierarchy_embeddings)
+        ]
+        return torch.cat(level_vectors, dim=-1)
+
+    def _valid_code_mask(self, codes: torch.Tensor) -> torch.Tensor:
+        """Mask padding, unknown, and out-of-vocabulary IDs from graph edges."""
+        return (
+            (codes != self.pad_idx)
+            & (codes != self.unk_idx)
+            & (codes >= 0)
+            & (codes < self.num_nodes)
+        )
+
+    def _get_values_and_mask(self, value) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Unpack a processor value, whose nested-sequence schema may include a mask."""
         if isinstance(value, torch.Tensor):
             return value, None
         schema = self.dataset.input_processors[self.feature_key].schema()
@@ -82,11 +240,11 @@ class SHy(BaseModel):
     def construct_initial_hypergraph(
         self, codes: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return patient-isolated incidence ``H`` and valid-visit mask.
+        """Build patient-isolated incidence H and a valid-visit mask.
 
-        ``H`` has shape ``[batch * num_nodes, batch * num_visits]``. Patient
-        blocks are disjoint, so shared code IDs cannot pass messages across
-        patients. Empty visits have no incident edges and are marked invalid.
+        H has shape [batch, num_nodes, num_visits]. H[b, i, j] is 1 when input
+        diagnosis ID i appears in visit j for patient b. Padding and <unk> IDs
+        are excluded because they do not identify a specific diagnosis.
         """
         if codes.dim() != 3:
             raise ValueError(
@@ -94,97 +252,91 @@ class SHy(BaseModel):
             )
         codes = codes.long()
         batch_size, num_visits, _ = codes.shape
-        device = codes.device
-        # Example: a visit [2, 3, 0] has two recorded codes and one padding slot.
-        # Zero is padding; IDs greater than zero (including unknown ID 1) count.
-        valid_codes = (codes > 0) & (codes < self.num_nodes)
+        valid_codes = self._valid_code_mask(codes)
         valid_visits = valid_codes.any(dim=-1)
 
-        # Flatten patient/code rows and patient/visit columns into separate blocks.
-        # With B=2, patient 0 occupies the first num_nodes rows and patient 1 the
-        # next num_nodes rows. Their columns are divided the same way. This is the
-        # block-diagonal construction that prevents cross-patient messages.
+        # One dense [codes, visits] matrix per patient, rather than a mostly-zero
+        # [batch*codes, batch*visits] block-diagonal matrix.
         H = torch.zeros(
-            batch_size * self.num_nodes,
-            batch_size * num_visits,
+            batch_size,
+            self.num_nodes,
+            num_visits,
             dtype=torch.float32,
-            device=device,
+            device=codes.device,
         )
-        b_idx, v_idx, c_idx = valid_codes.nonzero(as_tuple=True)
-        if b_idx.numel():
-            # Each valid (patient, visit, code) occurrence sets one incidence to 1.
-            # A visit is a hyperedge; each code in it is one connected node.
-            rows = b_idx * self.num_nodes + codes[b_idx, v_idx, c_idx]
-            cols = b_idx * num_visits + v_idx
-            H[rows, cols] = 1.0
+        batch_idx, visit_idx, slot_idx = valid_codes.nonzero(as_tuple=True)
+        if batch_idx.numel():
+            code_ids = codes[batch_idx, visit_idx, slot_idx]
+            H[batch_idx, code_ids, visit_idx] = 1.0
         return H, valid_visits
 
-    def forward(self, **kwargs) -> Dict[str, torch.Tensor]:
-        codes, processor_mask = self._get_values_and_mask(kwargs[self.feature_key])
-        codes = codes.to(self.device).long()
+    def message_passing(
+        self, H: torch.Tensor, initial_M: torch.Tensor
+    ) -> torch.Tensor:
+        """Update code embeddings independently for each patient's hypergraph.
 
-        # 2) Convert those histories into H, the patient-specific visit/code map.
-        # valid_visits remembers which visit slots actually contain a code.
-        H, valid_visits = self.construct_initial_hypergraph(codes)
-        batch_size, num_visits, codes_per_visit = codes.shape
+        Args:
+            H: Batched incidence tensor [batch, codes, visits].
+            initial_M: Shared initial code table [codes, embedding_dim].
 
-        # 3) PyHealth's embedding layer turns every input code ID into a D-vector.
-        # The processor mask, when supplied, is forwarded in its expected format.
-        masks = {}
-        if processor_mask is not None:
-            processor_mask = processor_mask.to(self.device)
-            masks[self.feature_key] = processor_mask
-        embedded = self.embedding_model(
-            {self.feature_key: codes}, masks=masks
-        )[self.feature_key]
-        if embedded.dim() != 4:
-            raise ValueError(
-                "SHy expects EmbeddingModel output [B,V,C,D] for a nested code feature; "
-                f"got {tuple(embedded.shape)}"
+        Returns:
+            Patient-specific code states [batch, codes, embedding_dim].
+        """
+        if H.dim() != 3 or initial_M.dim() != 2:
+            raise ValueError("Expected H [B,N,V] and initial_M [N,D]")
+        if H.size(1) != initial_M.size(0):
+            raise ValueError("H code rows must match the rows of initial_M")
+
+        batch_size = H.size(0)
+        # Every patient starts from the same learned diagnosis table M. The
+        # separate batch axis lets each patient's graph produce its own updates.
+        node_states = initial_M.unsqueeze(0).expand(batch_size, -1, -1)
+
+        # A visit's degree is the number of diagnosis nodes connected to it.
+        # The clamp keeps empty padded visits finite; their H columns are zero.
+        visit_degree = H.sum(dim=1).clamp_min(1.0)  # [B, visits]
+
+        # Repeat the UniGIN update for each layer:
+        # 4a. Mean-pool code states into visit states (Hᵀ @ M).
+        # 4b. Sum the visit states back to each code (H @ V).
+        # 4c. Add the code's own state, transform, and apply LeakyReLU.
+        for linear, epsilon in zip(self.message_layers, self.message_eps):
+            visit_states = torch.bmm(H.transpose(1, 2), node_states)
+            visit_states = visit_states / visit_degree.unsqueeze(-1)
+            visit_aggregate = torch.bmm(H, visit_states)
+            node_states = self.message_activation(
+                linear((1.0 + epsilon) * node_states + visit_aggregate)
             )
+        return node_states
 
-        # 4) Pool code occurrences into node features, separately for each patient.
-        # If a code appears in multiple visits, average its embeddings for that
-        # patient's node. Padding and invalid IDs contribute nothing. The same
-        # diagnosis in two patients gets two separate rows due to patient_node_ids.
-        valid = (codes > 0) & (codes < self.num_nodes)
-        flat_patient = torch.arange(batch_size, device=self.device)[:, None, None]
-        patient_node_ids = flat_patient * self.num_nodes + codes.clamp(0, self.num_nodes - 1)
-        x = embedded.new_zeros((batch_size * self.num_nodes, self.embedding_dim))
-        counts = embedded.new_zeros((batch_size * self.num_nodes, 1))
-        if valid.any():
-            flat_ids = patient_node_ids[valid]
-            x.index_add_(0, flat_ids, embedded[valid])
-            counts.index_add_(0, flat_ids, embedded.new_ones((flat_ids.numel(), 1)))
-        x = x / counts.clamp_min(1.0)
-        x = self.activation(self.node_projection(x))
+    def forward(self, **kwargs) -> Dict[str, torch.Tensor]:
+        # STEP 1 — Decode the processed batch fields needed by this model.
+        # The integer IDs in `codes` use exactly the input processor mapping used
+        # above to create code_level_node_ids and therefore the rows of M.
+        codes, _processor_mask = self._get_values_and_mask(kwargs[self.feature_key])
+        codes = codes.to(self.device).long()
+        batch_size = codes.size(0)
 
-        # 5) Send information code -> visit -> code using H. Dividing by degrees
-        # averages the connected nodes/visits instead of letting large visits or
-        # frequently repeated nodes dominate just because they have more links.
-        edge_degree = H.sum(dim=0).clamp_min(1.0)
-        node_degree = H.sum(dim=1).clamp_min(1.0)
-        visit_repr = (H.transpose(0, 1) @ x) / edge_degree.unsqueeze(1)
-        visit_repr = self.activation(self.visit_projection(visit_repr))
-        node_repr = (H @ visit_repr) / node_degree.unsqueeze(1)
-        visit_repr = (H.transpose(0, 1) @ node_repr) / edge_degree.unsqueeze(1)
-        visit_repr = visit_repr.view(batch_size, num_visits, -1)
+        # STEP 2 — Build each patient's incidence matrix H from history codes.
+        H, _valid_visits = self.construct_initial_hypergraph(codes)
 
-        # 6) Fold each patient's visit vectors into one patient vector. Empty padded
-        # visits are masked out. The clamp makes a completely empty history produce
-        # zeros rather than a divide-by-zero/NaN.
-        visit_weights = valid_visits.to(visit_repr.dtype).unsqueeze(-1)
-        patient_repr = (visit_repr * visit_weights).sum(dim=1)
-        patient_repr = patient_repr / visit_weights.sum(dim=1).clamp_min(1.0)
+        # STEP 3 — Assemble M from the learnable per-level hierarchy embeddings.
+        # M is [num_nodes, embedding_dim].
+        initial_M = self._initial_code_embeddings()
+
+        # STEP 4 — Apply stacked UniGIN-style code -> visit -> code updates.
+        node_states = self.message_passing(H, initial_M)
+
+        # Temporary downstream pooling: average updated diagnosis vectors that
+        # actually occur in the patient's history; empty histories become zeros.
+        observed_nodes = H.sum(dim=2) > 0  # [B, num_nodes]
+        patient_repr = (node_states * observed_nodes.unsqueeze(-1)).sum(dim=1)
+        patient_repr = patient_repr / observed_nodes.sum(dim=1).clamp_min(1).unsqueeze(-1)
+        patient_repr = self.patient_activation(self.patient_projection(patient_repr))
         logits = self.classifier(patient_repr)
 
-        # 7) Each logit position corresponds to the label processor's vocabulary.
-        # Thus input IDs and label IDs may be numbered differently; the learned
-        # classifier connects the history representation to the target positions.
         result = {"logit": logits, "y_prob": self.prepare_y_prob(logits)}
         if self.label_key in kwargs:
-            # Training/evaluation batches include the multi-hot target, such as
-            # next_conditions. PyHealth's configured loss compares it to logits.
             y_true = kwargs[self.label_key].to(self.device)
             result["y_true"] = y_true
             result["loss"] = self.get_loss_function()(logits, y_true)
