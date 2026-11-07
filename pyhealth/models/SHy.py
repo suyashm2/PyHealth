@@ -32,6 +32,7 @@ import warnings
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from pyhealth.datasets import SampleDataset
 from pyhealth.medcode import InnerMap
@@ -48,6 +49,8 @@ class SHy(BaseModel):
         hidden_dim: Optional[int] = None,
         num_hierarchy_levels: int = 4,
         num_message_passing_layers: int = 2,
+        augmentation_ratio: float = 0.2,
+        num_similarity_heads: int = 10,
     ) -> None:
         super().__init__(dataset=dataset)
         if len(self.feature_keys) != 1:
@@ -63,6 +66,10 @@ class SHy(BaseModel):
             )
         if num_message_passing_layers <= 0:
             raise ValueError("num_message_passing_layers must be positive")
+        if augmentation_ratio < 0:
+            raise ValueError("augmentation_ratio must be non-negative")
+        if num_similarity_heads <= 0:
+            raise ValueError("num_similarity_heads must be positive")
 
         self.feature_key = self.feature_keys[0]
         self.label_key = self.label_keys[0]
@@ -70,6 +77,8 @@ class SHy(BaseModel):
         self.embedding_dim = embedding_dim
         self.num_hierarchy_levels = num_hierarchy_levels
         self.per_level_dim = embedding_dim // num_hierarchy_levels
+        self.augmentation_ratio = float(augmentation_ratio)
+        self.num_similarity_heads = num_similarity_heads
         hidden_dim = hidden_dim or embedding_dim
 
         # ---------------------------------------------------------------------
@@ -149,6 +158,13 @@ class SHy(BaseModel):
             [nn.Parameter(torch.zeros(())) for _ in range(num_message_passing_layers)]
         )
         self.message_activation = nn.LeakyReLU()
+
+        # STEP 5 — Learn the feature-wise weights used to score missing links.
+        # Each row is one weighted-cosine head Phi_k from the SHy paper.
+        # The paper's selected setup uses n_s=10 heads and p=0.2.
+        self.similarity_projections = nn.Parameter(
+            torch.randn(num_similarity_heads, embedding_dim)
+        )
 
         # The paper's temporal phenotype predictor is not implemented yet. This
         # pooling/classifier head is a temporary downstream prediction scaffold.
@@ -309,6 +325,108 @@ class SHy(BaseModel):
             )
         return node_states
 
+    def augment_hypergraph(
+        self,
+        H: torch.Tensor,
+        node_states: torch.Tensor,
+        visit_states: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Add high-scoring missing code-to-visit links, patient by patient.
+
+        This follows SHy's missing-diagnosis augmentation: score every currently
+        absent code/visit pair with an average of weighted cosine similarities,
+        then add ``floor(p * existing_edge_count)`` of the strongest pairs.
+
+        Args:
+            H: Original incidence tensor [B, N, V].
+            node_states: Updated code embeddings [B, N, D].
+            visit_states: Embeddings of the original visits [B, V, D].
+
+        Returns:
+            ``(H_augmented, added_edges)``. Both have shape [B, N, V];
+            ``added_edges`` contains 1 only for newly selected connections.
+        """
+        if H.dim() != 3 or node_states.dim() != 3 or visit_states.dim() != 3:
+            raise ValueError("Expected H [B,N,V], node_states [B,N,D], visit_states [B,V,D]")
+        batch_size, num_nodes, num_visits = H.shape
+        if node_states.shape[:2] != (batch_size, num_nodes):
+            raise ValueError("node_states batch/code dimensions must match H")
+        if visit_states.shape[:2] != (batch_size, num_visits):
+            raise ValueError("visit_states batch/visit dimensions must match H")
+
+        added_edges = torch.zeros_like(H)
+
+        # STEP 5a — p=0 is the ablation with missing-diagnosis augmentation off.
+        if self.augmentation_ratio == 0 or num_visits == 0 or num_nodes == 0:
+            return H, added_edges
+
+        # Process one patient at a time. Scores are only [codes, visits], so
+        # memory stays patient-local and no patient's visits can affect another.
+        for patient_idx in range(batch_size):
+            patient_H = H[patient_idx]
+            existing_edge_count = int(patient_H.sum().item())
+            if existing_edge_count == 0:
+                # With no observed visits there is no evidence to augment from.
+                continue
+
+            # STEP 5b — Determine eligible rows and columns.
+            # Padding/unknown code rows and all-padding visit columns are never
+            # candidates. Existing connections are masked in the scoring step.
+            code_is_valid = torch.ones(num_nodes, dtype=torch.bool, device=H.device)
+            if 0 <= self.pad_idx < num_nodes:
+                code_is_valid[self.pad_idx] = False
+            if 0 <= self.unk_idx < num_nodes:
+                code_is_valid[self.unk_idx] = False
+            visit_is_valid = patient_H.sum(dim=0) > 0
+            if not code_is_valid.any() or not visit_is_valid.any():
+                continue
+
+            # STEP 5c — Compute the paper's multi-head weighted-cosine scores.
+            # Each head applies its learned feature weights before normalizing;
+            # the dot product is then cosine similarity for every code/visit pair.
+            scores = torch.zeros(
+                num_nodes, num_visits, dtype=node_states.dtype, device=H.device
+            )
+            for projection in self.similarity_projections:
+                weighted_codes = F.normalize(
+                    node_states[patient_idx] * projection.unsqueeze(0),
+                    p=2,
+                    dim=-1,
+                    eps=1e-8,
+                )
+                weighted_visits = F.normalize(
+                    visit_states[patient_idx] * projection.unsqueeze(0),
+                    p=2,
+                    dim=-1,
+                    eps=1e-8,
+                )
+                scores = scores + weighted_codes @ weighted_visits.transpose(0, 1)
+            scores = scores / self.num_similarity_heads
+
+            # A pair is selectable only if its code row and visit column are
+            # valid AND it is not already an edge in the original hypergraph.
+            eligible_pairs = code_is_valid.unsqueeze(1) & visit_is_valid.unsqueeze(0)
+            missing_pairs = (patient_H == 0) & eligible_pairs
+            scores = scores.masked_fill(~missing_pairs, float("-inf"))
+
+            # STEP 5d — Add the strongest k missing links for this patient.
+            # k uses the number of original edges (the paper's p hyperparameter),
+            # capped by available candidates so top-k remains well-defined.
+            num_candidates = int(missing_pairs.sum().item())
+            num_to_add = min(
+                int(self.augmentation_ratio * existing_edge_count), num_candidates
+            )
+            if num_to_add == 0:
+                continue
+            selected = torch.topk(scores.flatten(), k=num_to_add).indices
+            selected_codes = torch.div(selected, num_visits, rounding_mode="floor")
+            selected_visits = selected.remainder(num_visits)
+            added_edges[patient_idx, selected_codes, selected_visits] = 1.0
+
+        # STEP 5e — Union the original incidence links with the new links.
+        # Addition is safe because the selected pairs were explicitly missing.
+        return H + added_edges, added_edges
+
     def forward(self, **kwargs) -> Dict[str, torch.Tensor]:
         # STEP 1 — Decode the processed batch fields needed by this model.
         # The integer IDs in `codes` use exactly the input processor mapping used
@@ -327,9 +445,20 @@ class SHy(BaseModel):
         # STEP 4 — Apply stacked UniGIN-style code -> visit -> code updates.
         node_states = self.message_passing(H, initial_M)
 
+        # STEP 5 — Build visit embeddings from the ORIGINAL patient hypergraphs.
+        # SHy's augmentation scores compare updated code states with these visit
+        # states, then H_aug records the extra likely-missing diagnoses.
+        visit_degree = H.sum(dim=1).clamp_min(1.0)
+        visit_states = torch.bmm(H.transpose(1, 2), node_states)
+        visit_states = visit_states / visit_degree.unsqueeze(-1)
+        H_augmented, _added_edges = self.augment_hypergraph(
+            H, node_states, visit_states
+        )
+
         # Temporary downstream pooling: average updated diagnosis vectors that
-        # actually occur in the patient's history; empty histories become zeros.
-        observed_nodes = H.sum(dim=2) > 0  # [B, num_nodes]
+        # occur in the augmented history; empty histories become zeros. Later
+        # phenotype extraction should consume H_augmented directly.
+        observed_nodes = H_augmented.sum(dim=2) > 0  # [B, num_nodes]
         patient_repr = (node_states * observed_nodes.unsqueeze(-1)).sum(dim=1)
         patient_repr = patient_repr / observed_nodes.sum(dim=1).clamp_min(1).unsqueeze(-1)
         patient_repr = self.patient_activation(self.patient_projection(patient_repr))

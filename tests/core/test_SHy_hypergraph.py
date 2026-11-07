@@ -4,9 +4,10 @@ Run from this directory with either:
     python test_shy_hypergraph.py
     python -m pytest test_shy_hypergraph.py
 
-These synthetic checks cover incidence construction and the code -> visit -> code
-message-passing step. They do not initialize a full PyHealth dataset or test
-training, ICD-9 hierarchy lookups, phenotype extraction, or prediction quality.
+These synthetic checks cover incidence construction, code -> visit -> code
+message passing, and missing-diagnosis augmentation. They do not initialize a
+full PyHealth dataset or test training, ICD-9 hierarchy lookups, phenotype
+extraction, or prediction quality.
 """
 import torch
 import torch.nn as nn
@@ -34,6 +35,17 @@ def make_message_passing_model(num_nodes: int = 6) -> SHy:
     model.message_layers = nn.ModuleList([nn.Identity()])
     model.message_eps = nn.ParameterList([nn.Parameter(torch.tensor(0.0))])
     model.message_activation = nn.LeakyReLU()
+    return model
+
+
+def make_augmentation_model(num_nodes: int = 7) -> SHy:
+    """Create deterministic augmentation settings without loading a dataset."""
+    model = make_hypergraph_builder(num_nodes)
+    # Two original edges per patient and p=0.5 means exactly one new edge each.
+    model.augmentation_ratio = 0.5
+    model.num_similarity_heads = 1
+    # A simple positive feature weighting makes hand-computed cosine scores clear.
+    model.similarity_projections = nn.Parameter(torch.tensor([[1.0, 1.0]]))
     return model
 
 
@@ -114,9 +126,59 @@ def test_message_passing_updates_codes_without_cross_patient_mixing() -> None:
     assert torch.isclose(updated[1, 5, 0], torch.tensor(20.0))
     # Patient 1 did not have code 2, so patient 0's message cannot update it.
     assert torch.isclose(updated[1, 2, 0], torch.tensor(2.0))
-    print('Message Passing passed!')
+
+
+def test_missing_diagnosis_augmentation_adds_only_valid_patient_local_edges() -> None:
+    # Create two patients with two observed visits and one padded visit column.
+    # The matrices are patient-specific: each patient has two original links.
+    H = torch.zeros((2, 7, 3), dtype=torch.float32)
+    H[0, 2, 0] = 1.0  # Patient 0: code 2 is in visit 0.
+    H[0, 4, 1] = 1.0  # Patient 0: code 4 is in visit 1.
+    H[1, 5, 0] = 1.0  # Patient 1: code 5 is in visit 0.
+    H[1, 6, 1] = 1.0  # Patient 1: code 6 is in visit 1.
+    # Visit column 2 is empty for both patients (batch padding).
+
+    # Supply embeddings where we can predict the strongest missing links:
+    # Patient 0's code 3 best matches visit 0; patient 1's code 2 best matches
+    # visit 1. The patients intentionally have different visit embeddings.
+    node_states = torch.zeros((2, 7, 2), dtype=torch.float32)
+    node_states[0, 2] = torch.tensor([1.0, 0.0])
+    node_states[0, 3] = torch.tensor([0.9, 0.1])
+    node_states[0, 4] = torch.tensor([0.0, 1.0])
+    node_states[1, 2] = torch.tensor([1.0, 0.0])
+    node_states[1, 3] = torch.tensor([0.8, 0.2])
+    node_states[1, 5] = torch.tensor([0.0, 1.0])
+    node_states[1, 6] = torch.tensor([1.0, 0.0])
+
+    visit_states = torch.zeros((2, 3, 2), dtype=torch.float32)
+    visit_states[0, 0] = torch.tensor([1.0, 0.0])
+    visit_states[0, 1] = torch.tensor([0.0, 1.0])
+    visit_states[1, 0] = torch.tensor([0.0, 1.0])
+    visit_states[1, 1] = torch.tensor([1.0, 0.0])
+    # Visit column 2 stays zero and should never receive an augmented edge.
+
+    model = make_augmentation_model()
+    augmented_H, added_edges = model.augment_hypergraph(H, node_states, visit_states)
+
+    # Each patient has two original edges, so floor(0.5 * 2) adds one link.
+    assert added_edges.sum(dim=(1, 2)).tolist() == [1.0, 1.0]
+    # The strongest pair is selected separately for each patient's embeddings.
+    assert added_edges[0, 3, 0].item() == 1.0
+    assert added_edges[1, 2, 1].item() == 1.0
+
+    # No selected pair was already present, and the original H is preserved.
+    assert torch.all((added_edges * H) == 0)
+    assert torch.equal(augmented_H, H + added_edges)
+    # Padding and unknown code rows (IDs 0 and 1) are never augmented.
+    assert added_edges[:, 0:2, :].sum().item() == 0.0
+    # Empty padded visit columns are not candidates for added connections.
+    assert added_edges[:, :, 2].sum().item() == 0.0
+
+    print("Missing-diagnosis augmentation checks passed.")
+    print("New edges per patient:", added_edges.sum(dim=(1, 2)).tolist())
 
 
 if __name__ == "__main__":
     test_patient_blocks_are_separate()
     test_message_passing_updates_codes_without_cross_patient_mixing()
+    test_missing_diagnosis_augmentation_adds_only_valid_patient_local_edges()
