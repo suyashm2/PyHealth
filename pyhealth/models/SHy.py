@@ -1,10 +1,11 @@
 """A PyHealth 2.1 compatible SHy starting point for next-visit diagnosis prediction.
 
-The model builds hierarchy-aware initial code embeddings and applies a batched
+The model builds hierarchy-aware initial code embeddings, applies a batched
 UniGIN-style code -> visit -> code message-passing step on patient-isolated
-hypergraphs. It is not yet a complete SHy reproduction: false-negative edge
-completion, temporal phenotype extraction, and the paper's explanation objectives
-are not implemented.
+hypergraphs, augments likely missing diagnosis-visit links, extracts
+phenotype-specific sub-hypergraphs, and embeds each phenotype over time with a
+GRU and visit attention. Phenotype-level prediction and auxiliary explanation
+objectives are still future work.
 
 Example task sample before PyHealth converts codes to token IDs::
 
@@ -51,14 +52,20 @@ class SHy(BaseModel):
         num_message_passing_layers: int = 2,
         augmentation_ratio: float = 0.2,
         num_similarity_heads: int = 10,
+        num_phenotypes: int = 5,
+        phenotype_temperature: float = 1.0,
+        phenotype_code_chunk_size: int = 128,
     ) -> None:
         super().__init__(dataset=dataset)
         if len(self.feature_keys) != 1:
             raise ValueError("SHy currently expects exactly one nested code feature")
         if len(self.label_keys) != 1:
             raise ValueError("SHy currently expects exactly one label key")
-        if num_hierarchy_levels <= 0:
-            raise ValueError("num_hierarchy_levels must be positive")
+        if num_hierarchy_levels != 4:
+            raise ValueError(
+                "SHy's ICD-9 hierarchy uses exactly four levels: chapter, "
+                "section, category, and full diagnosis code"
+            )
         if embedding_dim % num_hierarchy_levels != 0:
             raise ValueError(
                 "embedding_dim must be divisible by num_hierarchy_levels so each "
@@ -70,6 +77,12 @@ class SHy(BaseModel):
             raise ValueError("augmentation_ratio must be non-negative")
         if num_similarity_heads <= 0:
             raise ValueError("num_similarity_heads must be positive")
+        if num_phenotypes <= 0:
+            raise ValueError("num_phenotypes must be positive")
+        if phenotype_temperature <= 0:
+            raise ValueError("phenotype_temperature must be positive")
+        if phenotype_code_chunk_size <= 0:
+            raise ValueError("phenotype_code_chunk_size must be positive")
 
         self.feature_key = self.feature_keys[0]
         self.label_key = self.label_keys[0]
@@ -79,7 +92,11 @@ class SHy(BaseModel):
         self.per_level_dim = embedding_dim // num_hierarchy_levels
         self.augmentation_ratio = float(augmentation_ratio)
         self.num_similarity_heads = num_similarity_heads
+        self.num_phenotypes = num_phenotypes
+        self.phenotype_temperature = float(phenotype_temperature)
+        self.phenotype_code_chunk_size = phenotype_code_chunk_size
         hidden_dim = hidden_dim or embedding_dim
+        self.hidden_dim = hidden_dim
 
         # ---------------------------------------------------------------------
         # STEP 1 — Recover PyHealth's exact input-code <-> integer-ID mapping.
@@ -110,13 +127,14 @@ class SHy(BaseModel):
         self.unk_idx = int(code_vocab.get("<unk>", 1))
 
         # ---------------------------------------------------------------------
-        # STEP 2 — Resolve every input diagnosis to a fixed-width ICD-9 path.
+        # STEP 2 — Resolve each input diagnosis to SHy's four semantic levels.
         # 2a. Standardize strings such as "4280" to the hierarchy's "428.0".
-        # 2b. Ask PyHealth's ICD9CM map for the code's ancestors.
-        # 2c. Drop ICD-9's universal root, keep the most-specific levels when a
-        #     path exceeds L, and add code-specific virtual children when shorter.
-        # 2d. Assign a level-local integer ID to every hierarchy node. Special
-        #     tokens get their own IDs and will be masked from graph operations.
+        # 2b. Read PyHealth's ancestors and identify the broad chapter/section
+        #     ranges, then derive the category and retain the complete code.
+        # 2c. Remove only the universal numeric root. V/E range roots remain as
+        #     their real chapter nodes. Ignore intermediate decimal subcodes.
+        # 2d. Assign a level-local integer ID to each node. Special tokens get
+        #     their own IDs and are masked from graph operations.
         # ---------------------------------------------------------------------
         icd9cm = InnerMap.load("ICD9CM")
         code_level_node_ids, level_vocab_sizes, unmapped = self._make_level_node_ids(
@@ -125,7 +143,8 @@ class SHy(BaseModel):
         if unmapped:
             warnings.warn(
                 f"{len(unmapped)} input tokens were not found in the ICD-9-CM "
-                "hierarchy. They receive code-specific virtual hierarchy nodes.",
+                "hierarchy. Following the SHy preprocessing, they share the "
+                "all-zero hierarchy path.",
                 stacklevel=2,
             )
         self.register_buffer("code_level_node_ids", code_level_node_ids)
@@ -166,8 +185,37 @@ class SHy(BaseModel):
             torch.randn(num_similarity_heads, embedding_dim)
         )
 
-        # The paper's temporal phenotype predictor is not implemented yet. This
-        # pooling/classifier head is a temporary downstream prediction scaffold.
+        # STEP 6 — Create one independent diagnosis-visit mask scorer per phenotype.
+        # 6a. Each scorer reads the concatenated code and visit embeddings.
+        # 6b. Its scalar output is a Bernoulli logit for retaining that edge.
+        # 6c. extract_phenotypes uses hard-forward straight-through Gumbel-Sigmoid.
+        self.phenotype_extractors = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(2 * embedding_dim, hidden_dim),
+                    nn.ReLU(),
+                    nn.Linear(hidden_dim, 1),
+                )
+                for _ in range(num_phenotypes)
+            ]
+        )
+
+        # STEP 7 — Turn each phenotype's selected visits into a temporal vector.
+        # The GRU is shared across patients and phenotype IDs; each sequence is
+        # still distinct because its masked visit embeddings come from its own Ψ.
+        self.phenotype_gru = nn.GRU(
+            input_size=embedding_dim,
+            hidden_size=hidden_dim,
+            batch_first=True,
+        )
+        self.temporal_attention = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+        # Phenotype-level prediction is not implemented yet. This pooling and
+        # classifier head remains a temporary downstream prediction scaffold.
         self.patient_projection = nn.Linear(embedding_dim, hidden_dim)
         self.patient_activation = nn.ReLU()
         self.classifier = nn.Linear(hidden_dim, self.get_output_size())
@@ -176,8 +224,26 @@ class SHy(BaseModel):
     def _make_level_node_ids(
         id_to_code: Sequence[Optional[str]], icd9cm: Any, num_levels: int
     ) -> Tuple[torch.Tensor, List[int], List[str]]:
-        """Map each processor ID to one hierarchy-node ID at every level."""
-        level_vocabularies: List[Dict[str, int]] = [dict() for _ in range(num_levels)]
+        """Map processor IDs to [chapter, section, category, full-code] nodes.
+
+        PyHealth returns ancestors closest-first. We reverse them and retain the
+        first two non-universal range nodes as chapter and section. Intermediate
+        decimal nodes (for example ``250.0`` on the way to ``250.00``) are not
+        used as hierarchy levels; the category is the code's ICD-9 category
+        prefix, and the final level is always the complete standardized code.
+
+        As in the SHy preprocessing, hierarchy ID 0 is reserved at every level.
+        Codes missing from the ICD-9 range map receive [0, 0, 0, 0]; all known
+        hierarchy nodes receive positive IDs.
+        """
+        if num_levels != 4:
+            raise ValueError("ICD-9 hierarchy paths must have exactly four levels")
+
+        # SHy's preprocessing uses all-zero IDs for codes absent from its ICD-9
+        # range file. Reserve ID 0 in every table for that shared fallback.
+        level_vocabularies: List[Dict[str, int]] = [
+            {"__unmapped__": 0} for _ in range(num_levels)
+        ]
         rows: List[List[int]] = []
         unmapped: List[str] = []
         special_tokens = {"<pad>", "<unk>"}
@@ -185,33 +251,49 @@ class SHy(BaseModel):
         for raw_token in id_to_code:
             token = str(raw_token)
             if token in special_tokens:
-                # Special rows remain well-defined but are excluded by the code mask.
-                path = [f"__special__:{token}:level:{level}" for level in range(num_levels)]
+                # PyHealth's padding/unknown tokens are not diagnoses. Keep them
+                # in the same reserved zero slot used by SHy's preprocessing.
+                path = ["__unmapped__"] * num_levels
             else:
-                standardized = icd9cm.standardize(token)
                 try:
-                    # PyHealth returns ancestors nearest-first; reverse to root-first.
+                    standardized = icd9cm.standardize(token)
+                    # Ancestors arrive nearest-first. Reversing makes broad ICD
+                    # ranges appear before narrower ranges in the hierarchy.
                     ancestors = list(icd9cm.get_ancestors(standardized))
-                    path = list(reversed(ancestors)) + [standardized]
-                    # ICD9CM includes its universal 001-999.99 root in paths.
-                    # SHy's four disease levels start below that dataset-wide root.
-                    if path and path[0] == "001-999.99":
-                        path = path[1:]
-                except (KeyError, ValueError):
-                    # Preserve an embedding for a token absent from the ontology.
-                    path = [standardized]
-                    unmapped.append(token)
+                    root_first = list(reversed(ancestors))
 
-                if len(path) > num_levels:
-                    # Keep the most-specific levels, including the diagnosis itself.
-                    path = path[-num_levels:]
-                elif len(path) < num_levels:
-                    # A code may be a non-leaf or have no known ancestors. Add
-                    # code-specific virtual descendants so every row has L levels.
-                    path.extend(
-                        f"__virtual_child__:{standardized}:{depth}"
-                        for depth in range(num_levels - len(path))
+                    # 001-999.99 is the dataset-wide numeric root, not a disease
+                    # chapter. Remove it wherever it occurs. V/E family ranges
+                    # (such as V01-V91.99 or E000-E999.99) are retained: they are
+                    # meaningful chapter-level nodes for those code families.
+                    range_nodes = [
+                        node
+                        for node in root_first
+                        if "-" in node and node != "001-999.99"
+                    ]
+
+                    # The paper's four slots are Chapter -> Section -> Category
+                    # -> Full code. If a code path has no explicit section range,
+                    # use a shared placeholder under its chapter.
+                    if not range_nodes:
+                        raise KeyError(f"No ICD-9 chapter range for {standardized}")
+                    chapter = range_nodes[0]
+                    section = (
+                        range_nodes[1]
+                        if len(range_nodes) > 1
+                        else f"__no_section__:{chapter}"
                     )
+
+                    # ICD-9 numeric and V codes use a 3-character category
+                    # (e.g. 250 or V45); E codes use E plus three digits (E812).
+                    category_width = 4 if standardized.upper().startswith("E") else 3
+                    category = standardized[:category_width]
+                    path = [chapter, section, category, standardized]
+                except (KeyError, ValueError, TypeError):
+                    # Match SHy's released preprocessing: unmapped codes use
+                    # [0, 0, 0, 0], rather than code-specific virtual nodes.
+                    path = ["__unmapped__"] * num_levels
+                    unmapped.append(token)
 
             row_ids = []
             for level, hierarchy_node in enumerate(path):
@@ -427,6 +509,365 @@ class SHy(BaseModel):
         # Addition is safe because the selected pairs were explicitly missing.
         return H + added_edges, added_edges
 
+    def extract_phenotypes(
+        self,
+        H_augmented: torch.Tensor,
+        node_states: torch.Tensor,
+        visit_states: torch.Tensor,
+        *,
+        valid_visits: Optional[torch.Tensor] = None,
+        sample: Optional[bool] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Score all diagnosis-visit pairs and extract K sub-hypergraphs.
+
+        Equation 6 defines mask scores for every diagnosis/visit pair, including
+        pairs absent from H_augmented. Those masks are needed by SHy's distinctness
+        objective. Equation 8 then multiplies each mask by H_augmented, so only
+        existing augmented edges appear in the phenotype sub-hypergraphs.
+
+        Pair embeddings are evaluated in code-row chunks to avoid constructing a
+        huge [B,N,V,2D] tensor. The full mask tensor is not retained; instead,
+        ``mask_gram`` stores Gamma_j^T Gamma_j for every visit, which is the exact
+        sufficient statistic used by the paper's distinctness objective. The
+        resulting phenotype sub-hypergraphs are stored sparsely.
+
+        During training, ``sample=True`` (the default) uses a hard-forward,
+        straight-through Gumbel-Sigmoid sample, matching the authors' released
+        RelaxedBernoulliStraightThrough implementation. In evaluation, the default
+        is deterministic thresholding at probability 0.5.
+
+        Returns:
+            ``(phenotype_hypergraphs, mask_gram, edge_indices)``:
+            sparse COO phenotype graphs [B,K,N,V], per-visit Gamma Gram matrices
+            [B,V,K,K], and [E,3] coordinates [patient, code, visit] for the
+            augmented edges stored in the sparse phenotype graphs. The MLPs score
+            all valid code/visit pairs, not just these E stored graph edges.
+        """
+        # Shape guide for the tensors built below:
+        #   H_augmented[b, code, visit]       -> one patient's augmented graph
+        #   chunk_masks[k, local_code, visit] -> one phenotype's mask values
+        #   mask_gram[b, visit, k, l]         -> overlap of two phenotype masks
+        #   edge indices                      -> [patient, code, visit]
+        #   sparse tensor coordinates         -> [patient, phenotype, code, visit]
+        if H_augmented.dim() != 3 or node_states.dim() != 3 or visit_states.dim() != 3:
+            raise ValueError(
+                "Expected H_augmented [B,N,V], node_states [B,N,D], "
+                "and visit_states [B,V,D]"
+            )
+        batch_size, num_nodes, num_visits = H_augmented.shape
+        if node_states.shape[:2] != (batch_size, num_nodes):
+            raise ValueError("node_states batch/code dimensions must match H_augmented")
+        if visit_states.shape[:2] != (batch_size, num_visits):
+            raise ValueError("visit_states batch/visit dimensions must match H_augmented")
+        if node_states.size(-1) != visit_states.size(-1):
+            raise ValueError("Diagnosis and visit embedding dimensions must match")
+
+        # If callers do not pass the mask from H construction, infer valid visits
+        # from nonempty columns. Padded visits must not contribute to Gamma or loss.
+        if valid_visits is None:
+            valid_visits = H_augmented.sum(dim=1) > 0
+        else:
+            valid_visits = valid_visits.to(device=H_augmented.device, dtype=torch.bool)
+        if tuple(valid_visits.shape) != (batch_size, num_visits):
+            raise ValueError("valid_visits must have shape [B,V]")
+
+        if sample is None:
+            sample = self.training
+
+        # valid_code_rows has shape [N]: one Boolean per code row. PAD and UNK
+        # are special rows, so they are marked False instead of being diagnoses.
+        valid_code_rows = torch.ones(num_nodes, dtype=torch.bool, device=H_augmented.device)
+        if 0 <= self.pad_idx < num_nodes:
+            valid_code_rows[self.pad_idx] = False
+        if 0 <= self.unk_idx < num_nodes:
+            valid_code_rows[self.unk_idx] = False
+
+        # STEP 6a — Find augmented edges once. These are the only coordinates
+        # that can survive the final multiplication by H_augmented (Eq. 8).
+        edge_indices = (H_augmented > 0).nonzero(as_tuple=False)  # [E,3]: b, code, visit
+        # Unbind the three coordinate columns into E-length vectors.
+        edge_patients, edge_codes, edge_visits = edge_indices.unbind(dim=1)
+
+        # STEP 6b — Score the complete code x visit grid in manageable chunks.
+        # Each patient has its own node/visit embeddings. For each code chunk,
+        # build [codes-in-chunk, visits, 2D] pair features and score every pair.
+        all_patient_grams = []
+        edge_mask_chunks = []
+        edge_coordinate_chunks = []
+        for patient_idx in range(batch_size):
+            # Sum Gamma^T Gamma by visit as chunks are processed. This retains the
+            # full information needed by L_distinct without storing dense Gamma.
+            # Rows/columns of patient_gram are phenotype IDs (0..K-1).
+            # Its leading visit axis picks the visit whose diagnosis masks overlap.
+            patient_gram = node_states.new_zeros(
+                (num_visits, self.num_phenotypes, self.num_phenotypes)
+            )
+
+            for code_start in range(0, num_nodes, self.phenotype_code_chunk_size):
+                code_end = min(code_start + self.phenotype_code_chunk_size, num_nodes)
+                code_chunk = node_states[patient_idx, code_start:code_end]  # rows: C codes; cols: D features
+                code_count = code_chunk.size(0)
+
+                # Broadcast each code in this chunk against every visit, then
+                # concatenate embeddings as Equation 6 specifies: [M_i || V_j].
+                code_pairs = code_chunk[:, None, :].expand(
+                    code_count, num_visits, -1
+                )  # rows: code-in-chunk; columns: visit; last axis: D features
+                visit_pairs = visit_states[patient_idx][None, :, :].expand(
+                    code_count, -1, -1
+                )  # same [C,V,D] grid, with each visit repeated for each code
+                pair_features = torch.cat(
+                    [code_pairs, visit_pairs], dim=-1
+                )  # [C,V,2D]: each cell is [code embedding || visit embedding]
+
+                # Each phenotype's MLP scores every pair in this chunk.
+                chunk_logits = torch.stack(
+                    [
+                        extractor(pair_features).squeeze(-1)
+                        for extractor in self.phenotype_extractors
+                    ],
+                    dim=0,
+                )  # [K,C,V]: axes are phenotype, code-in-chunk, visit
+
+                # STEP 6c — Apply Gumbel-Sigmoid to all pairs, not only H~ edges.
+                if sample:
+                    uniform = torch.rand_like(chunk_logits).clamp_(1e-6, 1.0 - 1e-6)
+                    logistic_noise = torch.log(uniform) - torch.log1p(-uniform)
+                    relaxed = torch.sigmoid(
+                        (chunk_logits + logistic_noise) / self.phenotype_temperature
+                    )
+                    # Hard forward decisions (0/1), relaxed gradients backward.
+                    # This is the straight-through behavior used by the authors.
+                    hard_mask = (relaxed >= 0.5).to(relaxed.dtype)
+                    chunk_masks = hard_mask - relaxed.detach() + relaxed
+                else:
+                    # Deterministic test-time mask, equivalent to sigmoid(logit)>=0.5.
+                    chunk_masks = (chunk_logits >= 0).to(chunk_logits.dtype)
+
+                # PAD/UNK rows and padded visits do not represent real pairs.
+                chunk_code_valid = valid_code_rows[code_start:code_end]
+                # chunk_code_valid is [C]; valid_visits[patient_idx] is [V].
+                # Add singleton axes so AND broadcasts to a [1,C,V] grid.
+                valid_pair = chunk_code_valid[None, :, None] & valid_visits[
+                    patient_idx
+                ][None, None, :]
+                chunk_masks = chunk_masks * valid_pair.to(chunk_masks.dtype)
+                # valid_pair is [1,C,V], broadcast over all K phenotype masks.
+
+                # Accumulate the per-visit KxK Gram matrix across all code rows.
+                # This equals Gamma_j^T Gamma_j and supports L_distinct exactly.
+                patient_gram = patient_gram + torch.einsum(
+                    "kcv,lcv->vkl", chunk_masks, chunk_masks
+                )
+
+                # Save mask values only for augmented edges, forming Psi^k =
+                # H_augmented * Gamma^k. All other scores remain available through
+                # the Gram accumulation but are zero in the phenotype subgraphs.
+                on_patient = edge_patients == patient_idx
+                in_chunk = (edge_codes >= code_start) & (edge_codes < code_end)
+                chosen_edges = on_patient & in_chunk
+                if chosen_edges.any():
+                    chosen_coordinates = edge_indices[chosen_edges]  # [E_chunk,3]: b, code, visit
+                    local_codes = chosen_coordinates[:, 1] - code_start  # [E_chunk], rows in this chunk
+                    local_visits = chosen_coordinates[:, 2]  # [E_chunk], visit columns
+                    selected_masks = torch.stack(
+                        [
+                            chunk_masks[k, local_codes, local_visits]
+                            for k in range(self.num_phenotypes)
+                        ],
+                        dim=-1,
+                    )  # rows: selected links; columns: phenotype IDs 0..K-1
+                    edge_coordinate_chunks.append(chosen_coordinates)
+                    # Each row in selected_masks matches a row in chosen_coordinates:
+                    # [patient, code, visit] -> K mask values.
+                    edge_mask_chunks.append(selected_masks)
+
+            all_patient_grams.append(patient_gram)
+
+        # Stack each patient's sufficient statistics for the distinctness loss.
+        mask_gram = torch.stack(all_patient_grams, dim=0)  # [B,V,K,K]
+
+        # Assemble the sparse COO phenotype sub-hypergraphs from the saved edge
+        # coordinates and their K mask values. No dense [B,K,N,V] copy is made.
+        if edge_mask_chunks:
+            # Concatenate chunk rows: [E1,3] + [E2,3] -> [E,3].
+            subgraph_edge_indices = torch.cat(edge_coordinate_chunks, dim=0)
+            # Matching mask rows: [E1,K] + [E2,K] -> [E,K].
+            edge_mask_values = torch.cat(edge_mask_chunks, dim=0)  # [E,K]
+        else:
+            subgraph_edge_indices = torch.empty(
+                (0, 3), dtype=torch.long, device=H_augmented.device
+            )
+            edge_mask_values = node_states.new_empty((0, self.num_phenotypes))
+        subgraph_patients, subgraph_codes, subgraph_visits = subgraph_edge_indices.unbind(
+            dim=1
+        )
+        num_subgraph_edges = subgraph_edge_indices.size(0)
+        # phenotype_ids is [K,E]: each column is one link; rows list phenotype
+        # IDs 0..K-1 so every link gets one sparse coordinate per phenotype.
+        phenotype_ids = torch.arange(
+            self.num_phenotypes, device=H_augmented.device
+        ).unsqueeze(1).expand(-1, num_subgraph_edges)
+        # Build sparse coordinate rows in matching K-major order:
+        # [patient, phenotype, code, visit], one column per stored value.
+        sparse_indices = torch.stack(
+            [
+                subgraph_patients.unsqueeze(0)
+                .expand(self.num_phenotypes, -1)
+                .reshape(-1),
+                phenotype_ids.reshape(-1),
+                subgraph_codes.unsqueeze(0)
+                .expand(self.num_phenotypes, -1)
+                .reshape(-1),
+                subgraph_visits.unsqueeze(0)
+                .expand(self.num_phenotypes, -1)
+                .reshape(-1),
+            ],
+            dim=0,
+        )
+        # [E,K] -> [K,E] -> flat, matching phenotype-major sparse_indices order.
+        sparse_values = edge_mask_values.transpose(0, 1).reshape(-1)
+        phenotype_hypergraphs = torch.sparse_coo_tensor(
+            sparse_indices,
+            sparse_values,
+            size=(batch_size, self.num_phenotypes, num_nodes, num_visits),
+            device=H_augmented.device,
+        ).coalesce()
+        return phenotype_hypergraphs, mask_gram, subgraph_edge_indices
+
+    def embed_phenotypes_over_time(
+        self,
+        phenotype_hypergraphs: torch.Tensor,
+        node_states: torch.Tensor,
+        *,
+        valid_visits: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Embed each phenotype's diagnosis links over its visit sequence.
+
+        This implements the paper's Equation 9 and the following GRU/attention
+        steps. For every patient and phenotype, selected diagnosis embeddings are
+        summed into one vector per visit, passed through a shared GRU, then
+        combined with attention over valid visits.
+
+        Args:
+            phenotype_hypergraphs: Sparse COO ``[B,K,N,V]`` tensor produced by
+                :meth:`extract_phenotypes` (the nonzero values are mask weights).
+            node_states: Patient-specific diagnosis embeddings ``[B,N,D]``.
+            valid_visits: Optional Boolean visit mask ``[B,V]`` from the original
+                patient hypergraph. Pass this to keep visits valid even if a
+                phenotype selected no diagnoses there. If omitted, visits are
+                inferred from the union of edges across phenotype graphs.
+
+        Returns:
+            ``(phenotype_vectors, attention_weights, phenotype_visit_embeddings)``:
+            vectors ``[B,K,H]``, visit weights ``[B,K,V]``, and the summed
+            pre-GRU visit embeddings ``[B,K,V,D]``.
+        """
+        if phenotype_hypergraphs.layout != torch.sparse_coo:
+            raise ValueError("phenotype_hypergraphs must use sparse COO layout")
+        if phenotype_hypergraphs.dim() != 4 or node_states.dim() != 3:
+            raise ValueError("Expected phenotype graphs [B,K,N,V] and node_states [B,N,D]")
+
+        batch_size, num_phenotypes, num_nodes, num_visits = phenotype_hypergraphs.shape
+        if node_states.shape[:2] != (batch_size, num_nodes):
+            raise ValueError("node_states batch/code dimensions must match phenotype graphs")
+        if node_states.size(-1) != self.phenotype_gru.input_size:
+            raise ValueError("node_states embedding width must match the phenotype GRU")
+
+        # Sparse edge coordinates are [patient, phenotype, code, visit]. Each
+        # coordinate contributes its mask value times that patient's code vector.
+        coalesced_graphs = phenotype_hypergraphs.coalesce()
+        edge_coordinates = coalesced_graphs.indices()
+        edge_values = coalesced_graphs.values().to(dtype=node_states.dtype)
+        visit_sums = node_states.new_zeros(
+            (batch_size * num_phenotypes * num_visits, node_states.size(-1))
+        )
+        if edge_values.numel() > 0 and num_visits > 0:
+            edge_patients, edge_phenotypes, edge_codes, edge_visits = edge_coordinates.unbind(
+                dim=0
+            )
+            flat_visit_ids = (
+                (edge_patients * num_phenotypes + edge_phenotypes) * num_visits
+                + edge_visits
+            )
+            selected_code_states = node_states[edge_patients, edge_codes]
+            weighted_code_states = selected_code_states * edge_values.unsqueeze(-1)
+            visit_sums = visit_sums.index_add(0, flat_visit_ids, weighted_code_states)
+
+        # Restore axes: [patient, phenotype, visit, embedding]. This is ΨᵀM:
+        # a sum of the diagnosis embeddings selected for each phenotype/visit.
+        phenotype_visit_embeddings = visit_sums.reshape(
+            batch_size,
+            num_phenotypes,
+            num_visits,
+            node_states.size(-1),
+        )
+
+        if valid_visits is None:
+            # Without the original H mask, only visits represented by at least
+            # one stored phenotype edge can be identified as valid.
+            valid_visits = torch.zeros(
+                (batch_size, num_visits), dtype=torch.bool, device=node_states.device
+            )
+            active_edge_mask = edge_values != 0
+            if active_edge_mask.any():
+                active_coordinates = edge_coordinates[:, active_edge_mask]
+                valid_visits[active_coordinates[0], active_coordinates[3]] = True
+        else:
+            valid_visits = valid_visits.to(device=node_states.device, dtype=torch.bool)
+        if tuple(valid_visits.shape) != (batch_size, num_visits):
+            raise ValueError("valid_visits must have shape [B,V]")
+
+        # GRU treats each (patient, phenotype) pair as an independent sequence.
+        flattened_sequences = phenotype_visit_embeddings.reshape(
+            batch_size * num_phenotypes, num_visits, node_states.size(-1)
+        )
+        flattened_visit_mask = valid_visits[:, None, :].expand(
+            batch_size, num_phenotypes, num_visits
+        ).reshape(batch_size * num_phenotypes, num_visits)
+
+        if num_visits == 0:
+            visit_hidden_states = node_states.new_zeros(
+                (batch_size * num_phenotypes, 0, self.hidden_dim)
+            )
+            flat_attention_weights = node_states.new_zeros(
+                (batch_size * num_phenotypes, 0)
+            )
+        else:
+            visit_hidden_states, _ = self.phenotype_gru(flattened_sequences)
+            attention_logits = self.temporal_attention(visit_hidden_states).squeeze(-1)
+
+            # Mask padded visits before softmax. For a patient with no valid
+            # visits, temporarily use zeros to avoid softmax([-inf,...])=NaN,
+            # then explicitly return all-zero weights and vector.
+            has_valid_visit = flattened_visit_mask.any(dim=1, keepdim=True)
+            attention_logits = attention_logits.masked_fill(
+                ~flattened_visit_mask, float("-inf")
+            )
+            attention_logits = torch.where(
+                has_valid_visit, attention_logits, torch.zeros_like(attention_logits)
+            )
+            flat_attention_weights = torch.softmax(attention_logits, dim=-1)
+            flat_attention_weights = flat_attention_weights * flattened_visit_mask.to(
+                flat_attention_weights.dtype
+            )
+            flat_attention_weights = flat_attention_weights / flat_attention_weights.sum(
+                dim=-1, keepdim=True
+            ).clamp_min(1e-8)
+
+        # Attention weights sum the GRU outputs across time into one vector per
+        # phenotype. Invalid visits get zero weight; empty histories yield zero.
+        flat_vectors = torch.sum(
+            visit_hidden_states * flat_attention_weights.unsqueeze(-1), dim=1
+        )
+        phenotype_vectors = flat_vectors.reshape(
+            batch_size, num_phenotypes, self.hidden_dim
+        )
+        attention_weights = flat_attention_weights.reshape(
+            batch_size, num_phenotypes, num_visits
+        )
+        return phenotype_vectors, attention_weights, phenotype_visit_embeddings
+
     def forward(self, **kwargs) -> Dict[str, torch.Tensor]:
         # STEP 1 — Decode the processed batch fields needed by this model.
         # The integer IDs in `codes` use exactly the input processor mapping used
@@ -455,9 +896,29 @@ class SHy(BaseModel):
             H, node_states, visit_states
         )
 
-        # Temporary downstream pooling: average updated diagnosis vectors that
-        # occur in the augmented history; empty histories become zeros. Later
-        # phenotype extraction should consume H_augmented directly.
+        # STEP 6 — Extract the K phenotype-specific sub-hypergraphs.
+        # These are sparse Ψ tensors, one masked graph per patient and phenotype.
+        phenotype_hypergraphs, phenotype_mask_gram, phenotype_edge_indices = (
+            self.extract_phenotypes(
+                H_augmented,
+                node_states,
+                visit_states,
+                valid_visits=_valid_visits,
+            )
+        )
+
+        # STEP 7 — Encode each extracted phenotype through time (Eq. 9 onward).
+        phenotype_vectors, temporal_attention_weights, phenotype_visit_embeddings = (
+            self.embed_phenotypes_over_time(
+                phenotype_hypergraphs,
+                node_states,
+                valid_visits=_valid_visits,
+            )
+        )
+
+        # Temporary prediction scaffold: the phenotype vectors are now computed
+        # and exposed below, but phenotype-level attention and diagnosis
+        # prediction are the next stage. Until then, keep the earlier patient pool.
         observed_nodes = H_augmented.sum(dim=2) > 0  # [B, num_nodes]
         patient_repr = (node_states * observed_nodes.unsqueeze(-1)).sum(dim=1)
         patient_repr = patient_repr / observed_nodes.sum(dim=1).clamp_min(1).unsqueeze(-1)
@@ -465,6 +926,14 @@ class SHy(BaseModel):
         logits = self.classifier(patient_repr)
 
         result = {"logit": logits, "y_prob": self.prepare_y_prob(logits)}
+        # Expose intermediate phenotype structures and temporal vectors on request.
+        if kwargs.get("return_phenotypes", False):
+            result["phenotype_hypergraphs"] = phenotype_hypergraphs
+            result["phenotype_mask_gram"] = phenotype_mask_gram
+            result["phenotype_edge_indices"] = phenotype_edge_indices
+            result["phenotype_visit_embeddings"] = phenotype_visit_embeddings
+            result["phenotype_vectors"] = phenotype_vectors
+            result["temporal_attention_weights"] = temporal_attention_weights
         if self.label_key in kwargs:
             y_true = kwargs[self.label_key].to(self.device)
             result["y_true"] = y_true
