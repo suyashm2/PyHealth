@@ -5,8 +5,9 @@ UniGIN-style code -> visit -> code message-passing step on patient-isolated
 hypergraphs, augments likely missing diagnosis-visit links, extracts
 phenotype-specific sub-hypergraphs, and embeds each phenotype over time with a
 GRU and visit attention, then weights phenotype-specific diagnosis predictions.
-The decoder-based fidelity, distinctness, and phenotype-weight objectives are
-still future work.
+The training objective combines diagnosis prediction with the paper's
+hypergraph-reconstruction fidelity, phenotype distinctness, and phenotype
+importance regularization losses.
 
 Example task sample before PyHealth converts codes to token IDs::
 
@@ -59,6 +60,10 @@ class SHy(BaseModel):
         phenotype_attention_dim: int = 256,
         num_phenotype_attention_heads: int = 8,
         prediction_activation: str = "softmax",
+        # Authors' reported MIMIC-III/IV objective weights (README table).
+        fidelity_loss_weight: float = 0.003,
+        distinct_loss_weight: float = 0.00025,
+        alpha_loss_weight: float = 0.04,
     ) -> None:
         super().__init__(dataset=dataset)
         if len(self.feature_keys) != 1:
@@ -99,6 +104,8 @@ class SHy(BaseModel):
         prediction_activation = prediction_activation.lower()
         if prediction_activation not in {"softmax", "sigmoid"}:
             raise ValueError("prediction_activation must be 'softmax' or 'sigmoid'")
+        if min(fidelity_loss_weight, distinct_loss_weight, alpha_loss_weight) < 0:
+            raise ValueError("SHy explanation-loss weights must be non-negative")
 
         self.feature_key = self.feature_keys[0]
         self.label_key = self.label_keys[0]
@@ -120,6 +127,9 @@ class SHy(BaseModel):
         self.phenotype_attention_dim = phenotype_attention_dim
         self.num_phenotype_attention_heads = num_phenotype_attention_heads
         self.prediction_activation = prediction_activation
+        self.fidelity_loss_weight = float(fidelity_loss_weight)
+        self.distinct_loss_weight = float(distinct_loss_weight)
+        self.alpha_loss_weight = float(alpha_loss_weight)
         hidden_dim = hidden_dim or embedding_dim
         self.hidden_dim = hidden_dim
 
@@ -259,6 +269,17 @@ class SHy(BaseModel):
         # phenotype predictions are mixed using alpha. `prediction_activation`
         # selects the paper's softmax or the sigmoid ablation.
         self.diagnosis_classifier = nn.Linear(hidden_dim, self.get_output_size())
+
+        # STEP 10 — Reconstruct the original [code, visit] patient graph.
+        # Appendix C concatenates U_1..U_K and repeats that same context vector
+        # as the GRU input at every visit step. The resulting hidden state for
+        # each step is projected to code probabilities.
+        self.hypergraph_decoder_gru = nn.GRU(
+            input_size=num_phenotypes * hidden_dim,
+            hidden_size=hidden_dim,
+            batch_first=True,
+        )
+        self.hypergraph_decoder_output = nn.Linear(hidden_dim, self.num_nodes)
 
     @staticmethod
     def _make_level_node_ids(
@@ -959,6 +980,131 @@ class SHy(BaseModel):
         )
         return prediction_probs, phenotype_weights, phenotype_probs
 
+    def reconstruct_hypergraph(
+        self,
+        phenotype_vectors: torch.Tensor,
+        original_H: torch.Tensor,
+    ) -> torch.Tensor:
+        """Decode the original patient hypergraphs from their phenotype vectors.
+
+        Args:
+            phenotype_vectors: ``[B,K,H]`` Equation 12 vectors.
+            original_H: Original incidence tensor ``[B,N,V]``. The decoder uses
+                its shape and values as the reconstruction target.
+
+        Returns:
+            Reconstruction logits with shape ``[B,N,V]``. Sigmoid converts
+            these to per-code/per-visit probabilities for fidelity BCE.
+        """
+        batch_size, num_nodes, num_visits = original_H.shape
+        if phenotype_vectors.shape[:2] != (batch_size, self.num_phenotypes):
+            raise ValueError("phenotype_vectors batch/phenotype axes do not match SHy")
+        if num_nodes != self.num_nodes:
+            raise ValueError("original_H must match the input-code vocabulary")
+
+        # Concatenate U_1..U_K per patient into one [K * hidden_dim] context.
+        context = phenotype_vectors.reshape(batch_size, -1)
+        if num_visits == 0:
+            return original_H.new_empty((batch_size, num_nodes, 0))
+        # Appendix C feeds the same concatenated context to every GRU time step.
+        # Shape [B,T,K*H]: each row's context is repeated across its T visits.
+        decoder_sequence = context.unsqueeze(1).expand(-1, num_visits, -1)
+        decoded_states, _ = self.hypergraph_decoder_gru(decoder_sequence)
+        # GRU/output are [B,T,N]; transpose to incidence convention [B,N,T].
+        return self.hypergraph_decoder_output(decoded_states).transpose(1, 2)
+
+    def compute_paper_losses(
+        self,
+        prediction_probs: torch.Tensor,
+        y_true: torch.Tensor,
+        reconstruction_logits: torch.Tensor,
+        original_H: torch.Tensor,
+        valid_visits: torch.Tensor,
+        mask_gram: torch.Tensor,
+        phenotype_weights: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """Calculate SHy's prediction, fidelity, distinctness, and alpha losses.
+
+        The reductions follow the paper: BCE for diagnosis prediction and graph
+        reconstruction; per-patient averaging over valid visits for fidelity
+        and distinctness; and per-patient averaging for the alpha regularizer.
+        The final scalar is Eq. 16 with configurable epsilon/eta/omega weights.
+        """
+        y_true = y_true.to(device=prediction_probs.device, dtype=prediction_probs.dtype)
+        if y_true.shape != prediction_probs.shape:
+            raise ValueError(
+                f"next-visit labels must have shape {tuple(prediction_probs.shape)}, "
+                f"got {tuple(y_true.shape)}"
+            )
+        prediction_eps = 1e-7
+        loss_pred = F.binary_cross_entropy(
+            prediction_probs.clamp(prediction_eps, 1.0 - prediction_eps), y_true
+        )
+
+        # Fidelity: reconstruct each original diagnosis-by-visit matrix. Ignore
+        # padded visit columns; average each patient's BCE over its real visits
+        # and code vocabulary, then average patients (including empty histories
+        # as zero contribution rather than producing NaN).
+        if reconstruction_logits.shape != original_H.shape:
+            raise ValueError("reconstruction logits must have the same [B,N,V] shape as H")
+        valid_visits = valid_visits.to(device=original_H.device, dtype=torch.bool)
+        reconstruction_targets = original_H.to(
+            device=reconstruction_logits.device, dtype=reconstruction_logits.dtype
+        )
+        fidelity_cell_loss = F.binary_cross_entropy_with_logits(
+            reconstruction_logits, reconstruction_targets, reduction="none"
+        )
+        fidelity_mask = valid_visits[:, None, :].to(fidelity_cell_loss.dtype)
+        fidelity_per_patient = (fidelity_cell_loss * fidelity_mask).sum(dim=(1, 2))
+        fidelity_denominator = (
+            valid_visits.sum(dim=1).to(fidelity_cell_loss.dtype) * original_H.size(1)
+        ).clamp_min(1.0)
+        loss_fidelity = (fidelity_per_patient / fidelity_denominator).mean()
+
+        # Distinctness: mask_gram[b,v] is Gamma_v^T Gamma_v, shape [K,K].
+        # Penalize its spectral distance from identity for real visits only.
+        num_phenotypes = mask_gram.size(-1)
+        identity = torch.eye(
+            num_phenotypes, device=mask_gram.device, dtype=mask_gram.dtype
+        )
+        gram_error = identity - mask_gram
+        distinct_per_visit = torch.linalg.matrix_norm(
+            gram_error, ord=2, dim=(-2, -1)
+        )  # [B,V], matrix spectral norm per patient and visit
+        distinct_mask = valid_visits.to(
+            device=distinct_per_visit.device, dtype=distinct_per_visit.dtype
+        )
+        distinct_per_patient = (distinct_per_visit * distinct_mask).sum(dim=1)
+        loss_distinct = (
+            distinct_per_patient / distinct_mask.sum(dim=1).clamp_min(1.0)
+        ).mean()
+
+        # Alpha regularizer from the paper: balance deviation from uniformity
+        # against the L2 magnitude, computed independently for each patient.
+        alpha_mean = phenotype_weights.mean(dim=1, keepdim=True)
+        # This is sqrt(sum((alpha - mean)^2) / K), written as a vector norm
+        # divided by sqrt(K). vector_norm has a stable zero-gradient at a
+        # perfectly uniform alpha row, unlike sqrt(0) in the literal form.
+        alpha_spread = torch.linalg.vector_norm(
+            phenotype_weights - alpha_mean, ord=2, dim=1
+        ) / (phenotype_weights.size(1) ** 0.5)
+        alpha_norm = torch.linalg.vector_norm(phenotype_weights, ord=2, dim=1)
+        loss_alpha = -(alpha_spread - alpha_norm).mean()
+
+        loss_total = (
+            loss_pred
+            + self.fidelity_loss_weight * loss_fidelity
+            + self.distinct_loss_weight * loss_distinct
+            + self.alpha_loss_weight * loss_alpha
+        )
+        return {
+            "loss": loss_total,
+            "loss_pred": loss_pred,
+            "loss_fidelity": loss_fidelity,
+            "loss_distinct": loss_distinct,
+            "loss_alpha": loss_alpha,
+        }
+
     def forward(self, **kwargs) -> Dict[str, torch.Tensor]:
         # STEP 1 — Decode the processed batch fields needed by this model.
         # The integer IDs in `codes` use exactly the input processor mapping used
@@ -1012,6 +1158,9 @@ class SHy(BaseModel):
             self.predict_from_phenotypes(phenotype_vectors)
         )
 
+        # STEP 10 — Decode the original history for the fidelity objective.
+        reconstruction_logits = self.reconstruct_hypergraph(phenotype_vectors, H)
+
         # PyHealth's default multilabel loss expects logits. Convert the final
         # mixture probabilities back to equivalent logits so sigmoid(logit)
         # recovers exactly the selected softmax/sigmoid mixture probabilities.
@@ -1038,7 +1187,22 @@ class SHy(BaseModel):
         if self.label_key in kwargs:
             y_true = kwargs[self.label_key].to(self.device)
             result["y_true"] = y_true
-            result["loss"] = self.get_loss_function()(logits, y_true)
+            # Compute the paper's full objective, rather than only PyHealth's
+            # prediction loss. The current task's labels are multi-hot, so the
+            # prediction term is the paper's elementwise binary cross-entropy.
+            result.update(
+                self.compute_paper_losses(
+                    prediction_probs,
+                    y_true,
+                    reconstruction_logits,
+                    H,
+                    _valid_visits,
+                    phenotype_mask_gram,
+                    phenotype_weights,
+                )
+            )
+        if kwargs.get("return_phenotypes", False):
+            result["reconstruction_probs"] = torch.sigmoid(reconstruction_logits)
         if kwargs.get("embed", False):
             # Keep the phenotype axis: SHy predicts from K separate concepts.
             result["embed"] = phenotype_vectors

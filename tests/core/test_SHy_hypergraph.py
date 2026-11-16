@@ -4,10 +4,10 @@ Run from this directory with either:
     python test_shy_hypergraph.py
     python -m pytest test_shy_hypergraph.py
 
-These synthetic checks cover incidence construction, code -> visit -> code
-message passing, missing-diagnosis augmentation, and phenotype extraction. They
-do not initialize a full PyHealth dataset, test ICD-9 hierarchy lookups,
-or assess prediction quality.
+These synthetic checks cover incidence construction, message passing,
+augmentation, phenotype extraction and embedding, prediction, and the four
+terms in SHy's paper objective. They do not initialize a full PyHealth dataset
+or test ICD-9 hierarchy lookups.
 """
 import torch
 import torch.nn as nn
@@ -116,6 +116,20 @@ def make_phenotype_prediction_model(prediction_activation: str) -> SHy:
             )
         )
         model.diagnosis_classifier.bias.copy_(torch.tensor([0.4, -0.2, -0.5]))
+    return model
+
+
+def make_loss_model() -> SHy:
+    """Build the tiny decoder/loss components without a dataset or ICD lookup."""
+    model = make_hypergraph_builder(num_nodes=3)
+    model.num_phenotypes = 2
+    model.embedding_dim = 2
+    model.hidden_dim = 2
+    model.fidelity_loss_weight = 2.0
+    model.distinct_loss_weight = 3.0
+    model.alpha_loss_weight = 0.5
+    model.hypergraph_decoder_gru = nn.GRU(4, 2, batch_first=True)
+    model.hypergraph_decoder_output = nn.Linear(2, 3)
     return model
 
 
@@ -481,6 +495,109 @@ def test_phenotype_attention_and_softmax_sigmoid_prediction_switch() -> None:
     print("Final prediction shape:", tuple(softmax_prediction.shape))
 
 
+def test_paper_loss_terms_and_weighted_total() -> None:
+    # Two patients, three input diagnosis codes, and two history visits.
+    # Visit masks mark the second patient's second column as padding.
+    model = make_loss_model()
+    prediction_probs = torch.tensor(
+        [[0.8, 0.2], [0.25, 0.75]], requires_grad=True
+    )
+    labels = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+    original_H = torch.tensor(
+        [
+            [[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]],
+            [[0.0, 1.0], [0.0, 0.0], [1.0, 0.0]],
+        ]
+    )
+    valid_visits = torch.tensor([[True, True], [True, False]])
+    reconstruction_logits = torch.zeros_like(original_H, requires_grad=True)
+
+    # Gram matrices are [patient, visit, phenotype, phenotype]. Patient 0's
+    # first visit has orthogonal masks; the overlap in its second visit incurs
+    # a spectral norm penalty of 0.5. Patient 1's real visit incurs 1.0.
+    mask_gram = torch.tensor(
+        [
+            [[[1.0, 0.0], [0.0, 1.0]], [[1.0, 0.5], [0.5, 1.0]]],
+            [[[0.0, 0.0], [0.0, 0.0]], [[9.0, 9.0], [9.0, 9.0]]],
+        ],
+        requires_grad=True,
+    )
+    phenotype_weights = torch.tensor(
+        [[0.5, 0.5], [0.8, 0.2]], requires_grad=True
+    )
+
+    losses = model.compute_paper_losses(
+        prediction_probs,
+        labels,
+        reconstruction_logits,
+        original_H,
+        valid_visits,
+        mask_gram,
+        phenotype_weights,
+    )
+
+    # Prediction term: ordinary elementwise BCE, matching the paper's formula.
+    expected_pred = torch.nn.functional.binary_cross_entropy(
+        prediction_probs, labels
+    )
+    assert torch.allclose(losses["loss_pred"], expected_pred)
+    # Zero reconstruction logits predict 0.5 everywhere, so BCE is ln(2).
+    # Fidelity ignores the padded visit but averages each patient's valid cells.
+    assert torch.allclose(
+        losses["loss_fidelity"], torch.log(torch.tensor(2.0))
+    )
+    assert torch.allclose(losses["loss_distinct"], torch.tensor(0.625))
+
+    alpha_mean = phenotype_weights.mean(dim=1, keepdim=True)
+    alpha_spread = torch.linalg.vector_norm(
+        phenotype_weights - alpha_mean, dim=1
+    ) / (2.0 ** 0.5)
+    alpha_norm = torch.linalg.vector_norm(phenotype_weights, dim=1)
+    expected_alpha = -(alpha_spread - alpha_norm).mean()
+    assert torch.allclose(losses["loss_alpha"], expected_alpha)
+    expected_total = (
+        losses["loss_pred"]
+        + 2.0 * losses["loss_fidelity"]
+        + 3.0 * losses["loss_distinct"]
+        + 0.5 * losses["loss_alpha"]
+    )
+    assert torch.allclose(losses["loss"], expected_total)
+
+    # The complete weighted objective propagates gradients through prediction,
+    # reconstruction, mask Gram matrices, and phenotype importance weights.
+    losses["loss"].backward()
+    for tensor in (
+        prediction_probs,
+        reconstruction_logits,
+        mask_gram,
+        phenotype_weights,
+    ):
+        assert tensor.grad is not None
+        assert torch.isfinite(tensor.grad).all()
+    print("SHy paper-loss component and total-loss checks passed.")
+
+
+def test_hypergraph_decoder_reconstructs_original_shape_and_backpropagates() -> None:
+    model = make_loss_model()
+    phenotype_vectors = torch.randn(2, 2, 2, requires_grad=True)
+    # [patients, codes, visits], including one padded visit for patient 1.
+    original_H = torch.tensor(
+        [
+            [[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]],
+            [[0.0, 1.0], [0.0, 0.0], [1.0, 0.0]],
+        ]
+    )
+    reconstruction_logits = model.reconstruct_hypergraph(phenotype_vectors, original_H)
+    assert reconstruction_logits.shape == original_H.shape
+    assert torch.isfinite(reconstruction_logits).all()
+    torch.nn.functional.binary_cross_entropy_with_logits(
+        reconstruction_logits, original_H
+    ).backward()
+    assert phenotype_vectors.grad is not None
+    assert torch.isfinite(phenotype_vectors.grad).all()
+    print("SHy hypergraph decoder checks passed.")
+
+
 if __name__ == "__main__":
     test_patient_blocks_are_separate()
     test_message_passing_updates_codes_without_cross_patient_mixing()
@@ -488,3 +605,5 @@ if __name__ == "__main__":
     test_phenotype_extraction_masks_only_augmented_patient_edges()
     test_phenotype_visit_embeddings_and_temporal_attention()
     test_phenotype_attention_and_softmax_sigmoid_prediction_switch()
+    test_paper_loss_terms_and_weighted_total()
+    test_hypergraph_decoder_reconstructs_original_shape_and_backpropagates()
