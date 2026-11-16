@@ -85,6 +85,40 @@ def make_temporal_embedding_model(
     return model
 
 
+def make_phenotype_prediction_model(prediction_activation: str) -> SHy:
+    """Create small attention/classifier modules for Eq. 13–15 tests."""
+    model = make_hypergraph_builder(num_nodes=4)
+    model.hidden_dim = 2
+    model.num_phenotypes = 3
+    model.phenotype_attention_dim = 4
+    model.num_phenotype_attention_heads = 2
+    model.prediction_activation = prediction_activation
+    model.phenotype_query_projection = nn.Linear(2, 4)
+    model.phenotype_key_projection = nn.Linear(2, 4)
+    model.phenotype_value_projection = nn.Linear(2, 4)
+    model.phenotype_self_attention = nn.MultiheadAttention(
+        embed_dim=4,
+        num_heads=2,
+        batch_first=True,
+    )
+    model.phenotype_importance = nn.Linear(4, 1, bias=False)
+    model.diagnosis_classifier = nn.Linear(2, 3)
+    # Fixed classifier parameters make the softmax/sigmoid ablation comparison
+    # deterministic while still giving each phenotype a different prediction.
+    with torch.no_grad():
+        model.diagnosis_classifier.weight.copy_(
+            torch.tensor(
+                [
+                    [0.5, -0.25],
+                    [-0.2, 0.4],
+                    [0.3, 0.1],
+                ]
+            )
+        )
+        model.diagnosis_classifier.bias.copy_(torch.tensor([0.4, -0.2, -0.5]))
+    return model
+
+
 def test_patient_blocks_are_separate() -> None:
     # Two patients, each with two padded visit slots and two padded code slots.
     # Patient 0: visit 0 has codes 2 and 3; visit 1 has code 4.
@@ -385,9 +419,72 @@ def test_phenotype_visit_embeddings_and_temporal_attention() -> None:
     )
 
 
+def test_phenotype_attention_and_softmax_sigmoid_prediction_switch() -> None:
+    # Three Eq. 12 phenotype vectors for each of two patients.
+    phenotype_vectors = torch.tensor(
+        [
+            [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
+            [[-1.0, 0.5], [0.5, -1.0], [0.2, 0.3]],
+        ],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    model = make_phenotype_prediction_model("softmax")
+    model.eval()
+
+    # Equation 13–15: self-attention makes context-aware phenotypes, alpha
+    # weights the phenotypes, and each U_k gets its own diagnosis prediction.
+    softmax_prediction, alpha, per_phenotype_softmax = model.predict_from_phenotypes(
+        phenotype_vectors
+    )
+    assert softmax_prediction.shape == (2, 3), softmax_prediction.shape
+    assert alpha.shape == (2, 3), alpha.shape
+    assert per_phenotype_softmax.shape == (2, 3, 3), per_phenotype_softmax.shape
+
+    # Alpha is a distribution across phenotypes. Each phenotype's softmax is a
+    # distribution across diagnosis labels. Equation 15 mixes those predictions.
+    assert torch.all(alpha >= 0)
+    assert torch.allclose(alpha.sum(dim=1), torch.ones(2), atol=1e-6)
+    assert torch.allclose(
+        per_phenotype_softmax.sum(dim=-1), torch.ones((2, 3)), atol=1e-6
+    )
+    expected_softmax_prediction = (
+        alpha.unsqueeze(-1) * per_phenotype_softmax
+    ).sum(dim=1)
+    assert torch.allclose(softmax_prediction, expected_softmax_prediction)
+    assert torch.allclose(softmax_prediction.sum(dim=-1), torch.ones(2), atol=1e-6)
+
+    # Ablation switch: use independent sigmoid probabilities for each label,
+    # while preserving the same attention-derived phenotype importance weights.
+    model.prediction_activation = "sigmoid"
+    sigmoid_prediction, sigmoid_alpha, per_phenotype_sigmoid = (
+        model.predict_from_phenotypes(phenotype_vectors)
+    )
+    assert torch.allclose(sigmoid_alpha, alpha)
+    assert torch.all((per_phenotype_sigmoid >= 0) & (per_phenotype_sigmoid <= 1))
+    assert torch.all((sigmoid_prediction >= 0) & (sigmoid_prediction <= 1))
+    expected_sigmoid_prediction = (
+        sigmoid_alpha.unsqueeze(-1) * per_phenotype_sigmoid
+    ).sum(dim=1)
+    assert torch.allclose(sigmoid_prediction, expected_sigmoid_prediction)
+    # Unlike softmax, sigmoid does not require the diagnosis probabilities to sum to 1.
+    assert not torch.allclose(sigmoid_prediction.sum(dim=-1), torch.ones(2))
+    assert not torch.allclose(sigmoid_prediction, softmax_prediction)
+
+    # Confirm the prediction path is differentiable through phenotype vectors.
+    sigmoid_prediction[:, 0].sum().backward()
+    assert phenotype_vectors.grad is not None
+    assert torch.isfinite(phenotype_vectors.grad).all()
+
+    print("Phenotype attention and prediction-ablation checks passed.")
+    print("Phenotype importance weights shape:", tuple(alpha.shape))
+    print("Final prediction shape:", tuple(softmax_prediction.shape))
+
+
 if __name__ == "__main__":
     test_patient_blocks_are_separate()
     test_message_passing_updates_codes_without_cross_patient_mixing()
     test_missing_diagnosis_augmentation_adds_only_valid_patient_local_edges()
     test_phenotype_extraction_masks_only_augmented_patient_edges()
     test_phenotype_visit_embeddings_and_temporal_attention()
+    test_phenotype_attention_and_softmax_sigmoid_prediction_switch()

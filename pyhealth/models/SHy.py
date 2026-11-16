@@ -4,8 +4,9 @@ The model builds hierarchy-aware initial code embeddings, applies a batched
 UniGIN-style code -> visit -> code message-passing step on patient-isolated
 hypergraphs, augments likely missing diagnosis-visit links, extracts
 phenotype-specific sub-hypergraphs, and embeds each phenotype over time with a
-GRU and visit attention. Phenotype-level prediction and auxiliary explanation
-objectives are still future work.
+GRU and visit attention, then weights phenotype-specific diagnosis predictions.
+The decoder-based fidelity, distinctness, and phenotype-weight objectives are
+still future work.
 
 Example task sample before PyHealth converts codes to token IDs::
 
@@ -55,6 +56,9 @@ class SHy(BaseModel):
         num_phenotypes: int = 5,
         phenotype_temperature: float = 1.0,
         phenotype_code_chunk_size: int = 128,
+        phenotype_attention_dim: int = 256,
+        num_phenotype_attention_heads: int = 8,
+        prediction_activation: str = "softmax",
     ) -> None:
         super().__init__(dataset=dataset)
         if len(self.feature_keys) != 1:
@@ -83,10 +87,28 @@ class SHy(BaseModel):
             raise ValueError("phenotype_temperature must be positive")
         if phenotype_code_chunk_size <= 0:
             raise ValueError("phenotype_code_chunk_size must be positive")
+        if phenotype_attention_dim <= 0:
+            raise ValueError("phenotype_attention_dim must be positive")
+        if num_phenotype_attention_heads <= 0:
+            raise ValueError("num_phenotype_attention_heads must be positive")
+        if phenotype_attention_dim % num_phenotype_attention_heads != 0:
+            raise ValueError(
+                "phenotype_attention_dim must be divisible by "
+                "num_phenotype_attention_heads"
+            )
+        prediction_activation = prediction_activation.lower()
+        if prediction_activation not in {"softmax", "sigmoid"}:
+            raise ValueError("prediction_activation must be 'softmax' or 'sigmoid'")
 
         self.feature_key = self.feature_keys[0]
         self.label_key = self.label_keys[0]
-        self.mode = self.dataset.output_schema[self.label_key]
+        # BaseModel resolves the label processor to the plain task mode
+        # (e.g. "multilabel"); keep that normalized value for its loss helpers.
+        if prediction_activation == "sigmoid" and self.mode == "multiclass":
+            raise ValueError(
+                "The sigmoid prediction ablation is for multilabel diagnosis targets, "
+                "not multiclass targets"
+            )
         self.embedding_dim = embedding_dim
         self.num_hierarchy_levels = num_hierarchy_levels
         self.per_level_dim = embedding_dim // num_hierarchy_levels
@@ -95,6 +117,9 @@ class SHy(BaseModel):
         self.num_phenotypes = num_phenotypes
         self.phenotype_temperature = float(phenotype_temperature)
         self.phenotype_code_chunk_size = phenotype_code_chunk_size
+        self.phenotype_attention_dim = phenotype_attention_dim
+        self.num_phenotype_attention_heads = num_phenotype_attention_heads
+        self.prediction_activation = prediction_activation
         hidden_dim = hidden_dim or embedding_dim
         self.hidden_dim = hidden_dim
 
@@ -214,11 +239,26 @@ class SHy(BaseModel):
             nn.Linear(hidden_dim, 1),
         )
 
-        # Phenotype-level prediction is not implemented yet. This pooling and
-        # classifier head remains a temporary downstream prediction scaffold.
-        self.patient_projection = nn.Linear(embedding_dim, hidden_dim)
-        self.patient_activation = nn.ReLU()
-        self.classifier = nn.Linear(hidden_dim, self.get_output_size())
+        # STEP 8 — Let phenotypes exchange information, then estimate alpha.
+        # These defaults match the authors' released setup: key_dim=256 and
+        # eight self-attention heads. The explicit projections correspond to
+        # W_Q, W_K, and W_V; MultiheadAttention computes Equation 13 per head.
+        self.phenotype_query_projection = nn.Linear(hidden_dim, phenotype_attention_dim)
+        self.phenotype_key_projection = nn.Linear(hidden_dim, phenotype_attention_dim)
+        self.phenotype_value_projection = nn.Linear(hidden_dim, phenotype_attention_dim)
+        self.phenotype_self_attention = nn.MultiheadAttention(
+            embed_dim=phenotype_attention_dim,
+            num_heads=num_phenotype_attention_heads,
+            batch_first=True,
+        )
+        # Equation 14 maps each context-aware phenotype vector to one score.
+        self.phenotype_importance = nn.Linear(phenotype_attention_dim, 1, bias=False)
+
+        # STEP 9 — Predict diagnoses independently from every phenotype (Eq. 15).
+        # The same diagnosis classifier is applied to each U_k, then the per-
+        # phenotype predictions are mixed using alpha. `prediction_activation`
+        # selects the paper's softmax or the sigmoid ablation.
+        self.diagnosis_classifier = nn.Linear(hidden_dim, self.get_output_size())
 
     @staticmethod
     def _make_level_node_ids(
@@ -868,6 +908,57 @@ class SHy(BaseModel):
         )
         return phenotype_vectors, attention_weights, phenotype_visit_embeddings
 
+    def predict_from_phenotypes(
+        self, phenotype_vectors: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Apply SHy's phenotype self-attention and per-phenotype classifier.
+
+        This implements Equations 13–15. Self-attention lets phenotype vectors
+        exchange information, Equation 14 produces one importance weight per
+        phenotype, and Equation 15 mixes separate diagnosis predictions from
+        the original phenotype vectors.
+
+        Args:
+            phenotype_vectors: ``[B,K,H]`` vectors from Equation 12.
+
+        Returns:
+            ``(prediction_probs, phenotype_weights, phenotype_probs)`` with
+            shapes ``[B,C]``, ``[B,K]``, and ``[B,K,C]`` respectively.
+        """
+        if phenotype_vectors.dim() != 3:
+            raise ValueError("phenotype_vectors must have shape [B,K,H]")
+        if phenotype_vectors.size(-1) != self.hidden_dim:
+            raise ValueError("phenotype vector width must match hidden_dim")
+
+        # Equation 13: project U into query/key/value features, then run
+        # scaled dot-product multi-head attention across the phenotype axis.
+        queries = self.phenotype_query_projection(phenotype_vectors)
+        keys = self.phenotype_key_projection(phenotype_vectors)
+        values = self.phenotype_value_projection(phenotype_vectors)
+        attended_phenotypes, _ = self.phenotype_self_attention(
+            queries,
+            keys,
+            values,
+            need_weights=False,
+        )
+
+        # Equation 14: one score per phenotype, normalized across K.
+        importance_logits = self.phenotype_importance(attended_phenotypes).squeeze(-1)
+        phenotype_weights = torch.softmax(importance_logits, dim=1)
+
+        # Equation 15: each original U_k gets its own diagnosis distribution;
+        # alpha then combines those distributions (rather than combining U first).
+        phenotype_logits = self.diagnosis_classifier(phenotype_vectors)
+        if self.prediction_activation == "softmax":
+            phenotype_probs = torch.softmax(phenotype_logits, dim=-1)
+        else:
+            phenotype_probs = torch.sigmoid(phenotype_logits)
+        prediction_probs = torch.sum(
+            phenotype_weights.unsqueeze(-1) * phenotype_probs,
+            dim=1,
+        )
+        return prediction_probs, phenotype_weights, phenotype_probs
+
     def forward(self, **kwargs) -> Dict[str, torch.Tensor]:
         # STEP 1 — Decode the processed batch fields needed by this model.
         # The integer IDs in `codes` use exactly the input processor mapping used
@@ -916,14 +1007,21 @@ class SHy(BaseModel):
             )
         )
 
-        # Temporary prediction scaffold: the phenotype vectors are now computed
-        # and exposed below, but phenotype-level attention and diagnosis
-        # prediction are the next stage. Until then, keep the earlier patient pool.
-        observed_nodes = H_augmented.sum(dim=2) > 0  # [B, num_nodes]
-        patient_repr = (node_states * observed_nodes.unsqueeze(-1)).sum(dim=1)
-        patient_repr = patient_repr / observed_nodes.sum(dim=1).clamp_min(1).unsqueeze(-1)
-        patient_repr = self.patient_activation(self.patient_projection(patient_repr))
-        logits = self.classifier(patient_repr)
+        # STEP 8–9 — Weight phenotypes and combine their separate predictions.
+        prediction_probs, phenotype_weights, phenotype_prediction_probs = (
+            self.predict_from_phenotypes(phenotype_vectors)
+        )
+
+        # PyHealth's default multilabel loss expects logits. Convert the final
+        # mixture probabilities back to equivalent logits so sigmoid(logit)
+        # recovers exactly the selected softmax/sigmoid mixture probabilities.
+        probability_eps = 1e-7
+        if self.mode == "multiclass":
+            logits = prediction_probs.clamp_min(probability_eps).log()
+        else:
+            logits = torch.logit(
+                prediction_probs.clamp(min=probability_eps, max=1.0 - probability_eps)
+            )
 
         result = {"logit": logits, "y_prob": self.prepare_y_prob(logits)}
         # Expose intermediate phenotype structures and temporal vectors on request.
@@ -934,10 +1032,14 @@ class SHy(BaseModel):
             result["phenotype_visit_embeddings"] = phenotype_visit_embeddings
             result["phenotype_vectors"] = phenotype_vectors
             result["temporal_attention_weights"] = temporal_attention_weights
+            result["phenotype_importance_weights"] = phenotype_weights
+            result["phenotype_prediction_probs"] = phenotype_prediction_probs
+            result["prediction_probs"] = prediction_probs
         if self.label_key in kwargs:
             y_true = kwargs[self.label_key].to(self.device)
             result["y_true"] = y_true
             result["loss"] = self.get_loss_function()(logits, y_true)
         if kwargs.get("embed", False):
-            result["embed"] = patient_repr
+            # Keep the phenotype axis: SHy predicts from K separate concepts.
+            result["embed"] = phenotype_vectors
         return result
