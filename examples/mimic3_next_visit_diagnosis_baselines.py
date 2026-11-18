@@ -44,9 +44,10 @@ from pyhealth.datasets import MIMIC3Dataset, get_dataloader, split_by_patient
 from pyhealth.models import RETAIN, RNN, Transformer
 from pyhealth.tasks import NextVisitDiagnosisMIMIC3
 from pyhealth.trainer import Trainer
+from pyhealth.models.SHy import SHy
 
 SYNTHETIC_MIMIC3_ROOT = "https://storage.googleapis.com/pyhealth/Synthetic_MIMIC-III/"
-MODEL_CLASSES = {"rnn": RNN, "retain": RETAIN, "transformer": Transformer}
+MODEL_CLASSES = {"rnn": RNN, "retain": RETAIN, "transformer": Transformer, "shy": SHy}
 TOP_K_VALUES = [10, 20]
 
 

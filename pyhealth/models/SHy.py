@@ -468,6 +468,9 @@ class SHy(BaseModel):
             )
         return node_states
 
+    # Top-k turns similarities into integer edge choices, so gradients cannot
+    # flow through these scores; skip building an unused autograd graph.
+    @torch.no_grad()
     def augment_hypergraph(
         self,
         H: torch.Tensor,
@@ -503,68 +506,108 @@ class SHy(BaseModel):
         if self.augmentation_ratio == 0 or num_visits == 0 or num_nodes == 0:
             return H, added_edges
 
-        # Process one patient at a time. Scores are only [codes, visits], so
-        # memory stays patient-local and no patient's visits can affect another.
-        for patient_idx in range(batch_size):
-            patient_H = H[patient_idx]
-            existing_edge_count = int(patient_H.sum().item())
-            if existing_edge_count == 0:
-                # With no observed visits there is no evidence to augment from.
-                continue
+        # STEP 5b — Build patient-specific valid row/column masks. The B axis
+        # stays intact below; no patient's scores are compared with another's.
+        code_is_valid = torch.ones(num_nodes, dtype=torch.bool, device=H.device)
+        if 0 <= self.pad_idx < num_nodes:
+            code_is_valid[self.pad_idx] = False
+        if 0 <= self.unk_idx < num_nodes:
+            code_is_valid[self.unk_idx] = False
+        visit_is_valid = H.sum(dim=1) > 0  # [B,V], ignoring all-padding visits
+        # Each observed edge belongs to a valid visit by construction. Excluding
+        # PAD/UNK rows here gives the exact number of absent valid pairs without
+        # allocating a second full [B,N,V] Boolean tensor.
+        edge_counts = H.sum(dim=(1, 2)).to(torch.long)  # [B]
+        valid_edges_per_code = H.sum(dim=2) * code_is_valid[None, :]
+        valid_edge_counts = valid_edges_per_code.sum(dim=1).to(torch.long)
+        eligible_counts = code_is_valid.sum() * visit_is_valid.sum(dim=1)
+        candidate_counts = (eligible_counts - valid_edge_counts).clamp_min(0)
+        add_counts = torch.minimum(
+            torch.floor(edge_counts.to(node_states.dtype) * self.augmentation_ratio).to(
+                torch.long
+            ),
+            candidate_counts,
+        )
+        if batch_size == 0:
+            return H, added_edges
+        max_add_count = int(add_counts.max().item())
+        if max_add_count == 0:
+            return H, added_edges
 
-            # STEP 5b — Determine eligible rows and columns.
-            # Padding/unknown code rows and all-padding visit columns are never
-            # candidates. Existing connections are masked in the scoring step.
-            code_is_valid = torch.ones(num_nodes, dtype=torch.bool, device=H.device)
-            if 0 <= self.pad_idx < num_nodes:
-                code_is_valid[self.pad_idx] = False
-            if 0 <= self.unk_idx < num_nodes:
-                code_is_valid[self.unk_idx] = False
-            visit_is_valid = patient_H.sum(dim=0) > 0
-            if not code_is_valid.any() or not visit_is_valid.any():
-                continue
-
-            # STEP 5c — Compute the paper's multi-head weighted-cosine scores.
-            # Each head applies its learned feature weights before normalizing;
-            # the dot product is then cosine similarity for every code/visit pair.
-            scores = torch.zeros(
-                num_nodes, num_visits, dtype=node_states.dtype, device=H.device
+        # STEP 5c–d — Score bounded code chunks for the full patient batch, then
+        # merge each chunk's top candidates. This avoids both a Python loop over
+        # patients and a full [B,N,V] score allocation.
+        weighted_visit_heads = [
+            F.normalize(
+                visit_states * projection[None, None, :],
+                p=2,
+                dim=-1,
+                eps=1e-8,
             )
-            for projection in self.similarity_projections:
+            for projection in self.similarity_projections
+        ]
+        best_scores = None
+        best_indices = None
+        for code_start in range(0, num_nodes, self.phenotype_code_chunk_size):
+            code_end = min(code_start + self.phenotype_code_chunk_size, num_nodes)
+            code_chunk = node_states[:, code_start:code_end]
+            chunk_scores = torch.zeros(
+                (batch_size, code_end - code_start, num_visits),
+                dtype=node_states.dtype,
+                device=H.device,
+            )
+            for projection, weighted_visits in zip(
+                self.similarity_projections, weighted_visit_heads
+            ):
                 weighted_codes = F.normalize(
-                    node_states[patient_idx] * projection.unsqueeze(0),
+                    code_chunk * projection[None, None, :],
                     p=2,
                     dim=-1,
                     eps=1e-8,
                 )
-                weighted_visits = F.normalize(
-                    visit_states[patient_idx] * projection.unsqueeze(0),
-                    p=2,
-                    dim=-1,
-                    eps=1e-8,
+                chunk_scores = chunk_scores + torch.bmm(
+                    weighted_codes, weighted_visits.transpose(1, 2)
                 )
-                scores = scores + weighted_codes @ weighted_visits.transpose(0, 1)
-            scores = scores / self.num_similarity_heads
+            chunk_scores = chunk_scores / self.num_similarity_heads
 
-            # A pair is selectable only if its code row and visit column are
-            # valid AND it is not already an edge in the original hypergraph.
-            eligible_pairs = code_is_valid.unsqueeze(1) & visit_is_valid.unsqueeze(0)
-            missing_pairs = (patient_H == 0) & eligible_pairs
-            scores = scores.masked_fill(~missing_pairs, float("-inf"))
-
-            # STEP 5d — Add the strongest k missing links for this patient.
-            # k uses the number of original edges (the paper's p hyperparameter),
-            # capped by available candidates so top-k remains well-defined.
-            num_candidates = int(missing_pairs.sum().item())
-            num_to_add = min(
-                int(self.augmentation_ratio * existing_edge_count), num_candidates
+            chunk_is_valid = (
+                code_is_valid[code_start:code_end][None, :, None]
+                & visit_is_valid[:, None, :]
+                & (H[:, code_start:code_end] == 0)
             )
-            if num_to_add == 0:
-                continue
-            selected = torch.topk(scores.flatten(), k=num_to_add).indices
-            selected_codes = torch.div(selected, num_visits, rounding_mode="floor")
-            selected_visits = selected.remainder(num_visits)
-            added_edges[patient_idx, selected_codes, selected_visits] = 1.0
+            chunk_scores = chunk_scores.masked_fill(
+                ~chunk_is_valid, float("-inf")
+            ).reshape(batch_size, -1)
+            local_k = min(max_add_count, chunk_scores.size(1))
+            local_scores, local_indices = torch.topk(
+                chunk_scores, k=local_k, dim=1
+            )
+            # Convert this chunk's flattened [code,visit] offsets to offsets in
+            # the patient's full [N,V] matrix.
+            local_indices = local_indices + code_start * num_visits
+
+            if best_scores is None:
+                best_scores, best_indices = local_scores, local_indices
+            else:
+                merged_scores = torch.cat([best_scores, local_scores], dim=1)
+                merged_indices = torch.cat([best_indices, local_indices], dim=1)
+                keep_k = min(max_add_count, merged_scores.size(1))
+                best_scores, best_positions = torch.topk(
+                    merged_scores, k=keep_k, dim=1
+                )
+                best_indices = torch.gather(merged_indices, 1, best_positions)
+
+        # The batch top-k width is the maximum requested across patients; mask
+        # out the unused ranks for patients needing fewer added edges.
+        rank_is_selected = (
+            torch.arange(best_indices.size(1), device=H.device)[None, :]
+            < add_counts[:, None]
+        )
+        added_flat = H.new_zeros((batch_size, num_nodes * num_visits))
+        added_flat.scatter_(
+            1, best_indices, rank_is_selected.to(added_flat.dtype)
+        )
+        added_edges = added_flat.reshape(batch_size, num_nodes, num_visits)
 
         # STEP 5e — Union the original incidence links with the new links.
         # Addition is safe because the selected pairs were explicitly missing.
@@ -586,8 +629,9 @@ class SHy(BaseModel):
         objective. Equation 8 then multiplies each mask by H_augmented, so only
         existing augmented edges appear in the phenotype sub-hypergraphs.
 
-        Pair embeddings are evaluated in code-row chunks to avoid constructing a
-        huge [B,N,V,2D] tensor. The full mask tensor is not retained; instead,
+        Pair scores are evaluated for code chunks across the batch. The first
+        linear layer is factored into code and visit projections, avoiding a
+        huge [B,C,V,2D] concatenation. The full mask tensor is not retained; instead,
         ``mask_gram`` stores Gamma_j^T Gamma_j for every visit, which is the exact
         sufficient statistic used by the paper's distinctness objective. The
         resulting phenotype sub-hypergraphs are stored sparsely.
@@ -646,107 +690,78 @@ class SHy(BaseModel):
         # STEP 6a — Find augmented edges once. These are the only coordinates
         # that can survive the final multiplication by H_augmented (Eq. 8).
         edge_indices = (H_augmented > 0).nonzero(as_tuple=False)  # [E,3]: b, code, visit
-        # Unbind the three coordinate columns into E-length vectors.
-        edge_patients, edge_codes, edge_visits = edge_indices.unbind(dim=1)
+        # Keep code IDs for chunk selection; full coordinates are gathered later.
+        edge_codes = edge_indices[:, 1]
 
-        # STEP 6b — Score the complete code x visit grid in manageable chunks.
-        # Each patient has its own node/visit embeddings. For each code chunk,
-        # build [codes-in-chunk, visits, 2D] pair features and score every pair.
-        all_patient_grams = []
+        # STEP 6b — Score code chunks for every patient together.
+        # A chunk has shape [B,C,D]; its score grid is [B,K,C,V]. The batch axis
+        # is never collapsed, so no patient's visits can enter another's masks.
+        mask_gram = node_states.new_zeros(
+            (batch_size, num_visits, self.num_phenotypes, self.num_phenotypes)
+        )
         edge_mask_chunks = []
         edge_coordinate_chunks = []
-        for patient_idx in range(batch_size):
-            # Sum Gamma^T Gamma by visit as chunks are processed. This retains the
-            # full information needed by L_distinct without storing dense Gamma.
-            # Rows/columns of patient_gram are phenotype IDs (0..K-1).
-            # Its leading visit axis picks the visit whose diagnosis masks overlap.
-            patient_gram = node_states.new_zeros(
-                (num_visits, self.num_phenotypes, self.num_phenotypes)
+        for code_start in range(0, num_nodes, self.phenotype_code_chunk_size):
+            code_end = min(code_start + self.phenotype_code_chunk_size, num_nodes)
+            code_chunk = node_states[:, code_start:code_end]  # [B,C,D]
+
+            # The first MLP layer on [code || visit] can be split exactly into
+            # its code and visit projections. This avoids building the much
+            # larger concatenated [B,C,V,2D] pair-feature tensor.
+            logits_by_phenotype = []
+            for extractor in self.phenotype_extractors:
+                first_linear, activation, output_linear = extractor
+                code_hidden = F.linear(
+                    code_chunk, first_linear.weight[:, : node_states.size(-1)]
+                )  # [B,C,H], no bias yet
+                visit_hidden = F.linear(
+                    visit_states,
+                    first_linear.weight[:, node_states.size(-1) :],
+                    first_linear.bias,
+                )  # [B,V,H], includes the first-layer bias once
+                pair_hidden = activation(
+                    code_hidden[:, :, None, :] + visit_hidden[:, None, :, :]
+                )  # [B,C,V,H], same pre-activation as Linear([M_i || V_j])
+                logits_by_phenotype.append(output_linear(pair_hidden).squeeze(-1))
+            chunk_logits = torch.stack(logits_by_phenotype, dim=1)  # [B,K,C,V]
+
+            # STEP 6c — Apply Gumbel-Sigmoid to every valid pair, not just edges.
+            if sample:
+                uniform = torch.rand_like(chunk_logits).clamp_(1e-6, 1.0 - 1e-6)
+                logistic_noise = torch.log(uniform) - torch.log1p(-uniform)
+                relaxed = torch.sigmoid(
+                    (chunk_logits + logistic_noise) / self.phenotype_temperature
+                )
+                hard_mask = (relaxed >= 0.5).to(relaxed.dtype)
+                chunk_masks = hard_mask - relaxed.detach() + relaxed
+            else:
+                chunk_masks = (chunk_logits >= 0).to(chunk_logits.dtype)
+
+            # Mask padding and unknown code rows and each patient's padded visits.
+            valid_pair = (
+                valid_code_rows[code_start:code_end][None, :, None]
+                & valid_visits[:, None, :]
+            )  # [B,C,V], broadcast across phenotype axis K
+            chunk_masks = chunk_masks * valid_pair[:, None, :, :].to(
+                chunk_masks.dtype
             )
 
-            for code_start in range(0, num_nodes, self.phenotype_code_chunk_size):
-                code_end = min(code_start + self.phenotype_code_chunk_size, num_nodes)
-                code_chunk = node_states[patient_idx, code_start:code_end]  # rows: C codes; cols: D features
-                code_count = code_chunk.size(0)
+            # Per-visit Gram: sum over code rows, retaining [B,V,K,K] for L_distinct.
+            mask_gram = mask_gram + torch.einsum(
+                "bkcv,blcv->bvkl", chunk_masks, chunk_masks
+            )
 
-                # Broadcast each code in this chunk against every visit, then
-                # concatenate embeddings as Equation 6 specifies: [M_i || V_j].
-                code_pairs = code_chunk[:, None, :].expand(
-                    code_count, num_visits, -1
-                )  # rows: code-in-chunk; columns: visit; last axis: D features
-                visit_pairs = visit_states[patient_idx][None, :, :].expand(
-                    code_count, -1, -1
-                )  # same [C,V,D] grid, with each visit repeated for each code
-                pair_features = torch.cat(
-                    [code_pairs, visit_pairs], dim=-1
-                )  # [C,V,2D]: each cell is [code embedding || visit embedding]
-
-                # Each phenotype's MLP scores every pair in this chunk.
-                chunk_logits = torch.stack(
-                    [
-                        extractor(pair_features).squeeze(-1)
-                        for extractor in self.phenotype_extractors
-                    ],
-                    dim=0,
-                )  # [K,C,V]: axes are phenotype, code-in-chunk, visit
-
-                # STEP 6c — Apply Gumbel-Sigmoid to all pairs, not only H~ edges.
-                if sample:
-                    uniform = torch.rand_like(chunk_logits).clamp_(1e-6, 1.0 - 1e-6)
-                    logistic_noise = torch.log(uniform) - torch.log1p(-uniform)
-                    relaxed = torch.sigmoid(
-                        (chunk_logits + logistic_noise) / self.phenotype_temperature
-                    )
-                    # Hard forward decisions (0/1), relaxed gradients backward.
-                    # This is the straight-through behavior used by the authors.
-                    hard_mask = (relaxed >= 0.5).to(relaxed.dtype)
-                    chunk_masks = hard_mask - relaxed.detach() + relaxed
-                else:
-                    # Deterministic test-time mask, equivalent to sigmoid(logit)>=0.5.
-                    chunk_masks = (chunk_logits >= 0).to(chunk_logits.dtype)
-
-                # PAD/UNK rows and padded visits do not represent real pairs.
-                chunk_code_valid = valid_code_rows[code_start:code_end]
-                # chunk_code_valid is [C]; valid_visits[patient_idx] is [V].
-                # Add singleton axes so AND broadcasts to a [1,C,V] grid.
-                valid_pair = chunk_code_valid[None, :, None] & valid_visits[
-                    patient_idx
-                ][None, None, :]
-                chunk_masks = chunk_masks * valid_pair.to(chunk_masks.dtype)
-                # valid_pair is [1,C,V], broadcast over all K phenotype masks.
-
-                # Accumulate the per-visit KxK Gram matrix across all code rows.
-                # This equals Gamma_j^T Gamma_j and supports L_distinct exactly.
-                patient_gram = patient_gram + torch.einsum(
-                    "kcv,lcv->vkl", chunk_masks, chunk_masks
-                )
-
-                # Save mask values only for augmented edges, forming Psi^k =
-                # H_augmented * Gamma^k. All other scores remain available through
-                # the Gram accumulation but are zero in the phenotype subgraphs.
-                on_patient = edge_patients == patient_idx
-                in_chunk = (edge_codes >= code_start) & (edge_codes < code_end)
-                chosen_edges = on_patient & in_chunk
-                if chosen_edges.any():
-                    chosen_coordinates = edge_indices[chosen_edges]  # [E_chunk,3]: b, code, visit
-                    local_codes = chosen_coordinates[:, 1] - code_start  # [E_chunk], rows in this chunk
-                    local_visits = chosen_coordinates[:, 2]  # [E_chunk], visit columns
-                    selected_masks = torch.stack(
-                        [
-                            chunk_masks[k, local_codes, local_visits]
-                            for k in range(self.num_phenotypes)
-                        ],
-                        dim=-1,
-                    )  # rows: selected links; columns: phenotype IDs 0..K-1
-                    edge_coordinate_chunks.append(chosen_coordinates)
-                    # Each row in selected_masks matches a row in chosen_coordinates:
-                    # [patient, code, visit] -> K mask values.
-                    edge_mask_chunks.append(selected_masks)
-
-            all_patient_grams.append(patient_gram)
-
-        # Stack each patient's sufficient statistics for the distinctness loss.
-        mask_gram = torch.stack(all_patient_grams, dim=0)  # [B,V,K,K]
+            # Keep mask values only where H_augmented has an edge, to form Ψ.
+            # Select this code chunk's edges once for the whole batch instead of
+            # rescanning the full edge table separately for every patient.
+            in_chunk = (edge_codes >= code_start) & (edge_codes < code_end)
+            chosen_coordinates = edge_indices[in_chunk]
+            local_codes = chosen_coordinates[:, 1] - code_start
+            selected_masks = chunk_masks.permute(0, 2, 3, 1)[
+                chosen_coordinates[:, 0], local_codes, chosen_coordinates[:, 2]
+            ]  # [edges in chunk,K], aligned row-wise with [patient,code,visit]
+            edge_coordinate_chunks.append(chosen_coordinates)
+            edge_mask_chunks.append(selected_masks)
 
         # Assemble the sparse COO phenotype sub-hypergraphs from the saved edge
         # coordinates and their K mask values. No dense [B,K,N,V] copy is made.

@@ -44,6 +44,7 @@ def make_augmentation_model(num_nodes: int = 7) -> SHy:
     # Two original edges per patient and p=0.5 means exactly one new edge each.
     model.augmentation_ratio = 0.5
     model.num_similarity_heads = 1
+    model.phenotype_code_chunk_size = 2
     # A simple positive feature weighting makes hand-computed cosine scores clear.
     model.similarity_projections = nn.Parameter(torch.tensor([[1.0, 1.0]]))
     return model
