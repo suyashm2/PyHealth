@@ -146,7 +146,7 @@ class SHy(BaseModel):
                 "SHy needs the fitted input processor's `code_vocab` mapping "
                 "(diagnosis token -> integer ID) to align M with H"
             )
-        self.num_nodes = input_processor.size()
+        self.num_nodes = input_processor.vocab_size()
         id_to_token: List[Optional[str]] = [None] * self.num_nodes
         for token, token_id in code_vocab.items():
             token_id = int(token_id)
