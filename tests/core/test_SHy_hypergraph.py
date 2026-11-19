@@ -280,18 +280,17 @@ def test_phenotype_extraction_masks_only_augmented_patient_edges() -> None:
     visit_states = torch.randn((2, 3, 2), dtype=torch.float32)
     model = make_phenotype_extraction_model(num_phenotypes=3)
 
-    # Zero weights and biases make every logit exactly zero. At test time the
-    # deterministic 0.5 threshold therefore retains every valid code/visit pair.
-    # This makes the mask Gram matrix reveal that even code rows absent from H~
-    # were scored, while the phenotype subgraphs still contain only H~ edges.
+    # Zero weights and biases make every logit exactly zero. With deterministic
+    # evaluation, the 0.5 threshold therefore retains every valid code/visit
+    # pair, so each phenotype subgraph equals the patient's H~ exactly.
     for extractor in model.phenotype_extractors:
         for parameter in extractor.parameters():
             nn.init.zeros_(parameter)
 
-    # Evaluation is deterministic: logits are thresholded at probability 0.5.
+    # sample=False requests deterministic thresholding at probability 0.5.
     model.eval()
     phenotype_graphs, mask_gram, edge_indices = model.extract_phenotypes(
-        H_augmented, node_states, visit_states
+        H_augmented, node_states, visit_states, sample=False
     )
     assert phenotype_graphs.layout == torch.sparse_coo
     assert tuple(phenotype_graphs.shape) == (2, 3, 7, 3)
@@ -307,11 +306,13 @@ def test_phenotype_extraction_masks_only_augmented_patient_edges() -> None:
     # This also ensures the mask cannot connect one patient's code to another's visit.
     allowed_edges = H_augmented.unsqueeze(1).expand_as(dense_phenotypes) > 0
     assert torch.all((dense_phenotypes == 0) | allowed_edges)
-    # Since zero logits produce all-one masks, each valid visit's KxK Gram
-    # entries equal the number of valid diagnosis rows (IDs 2 through 6 = five).
-    # This proves the extractor also scored code rows absent from that patient's H~.
-    assert torch.all(mask_gram[:, 0] == 5.0)
-    assert torch.all(mask_gram[:, 1] == 5.0)
+    # Since zero logits produce all-one masks, each visit's KxK Gram entries
+    # equal the number of links that visit has in H~. As in the authors' code,
+    # codes absent from the patient's H~ do not count toward the Gram matrix.
+    links_per_visit = H_augmented.sum(dim=1)  # [B,V]
+    assert torch.equal(
+        mask_gram, links_per_visit[:, :, None, None].expand_as(mask_gram)
+    )
     assert torch.all(mask_gram[:, 2] == 0.0)
     # Those full-grid masks are filtered by H~: with all-one masks, each phenotype
     # subgraph must exactly match its patient's augmented incidence matrix.
@@ -515,7 +516,8 @@ def test_paper_loss_terms_and_weighted_total() -> None:
 
     # Gram matrices are [patient, visit, phenotype, phenotype]. Patient 0's
     # first visit has orthogonal masks; the overlap in its second visit incurs
-    # a spectral norm penalty of 0.5. Patient 1's real visit incurs 1.0.
+    # a Frobenius norm penalty of sqrt(0.5). Patient 1's real visit incurs
+    # sqrt(2), the Frobenius norm of the identity.
     mask_gram = torch.tensor(
         [
             [[[1.0, 0.0], [0.0, 1.0]], [[1.0, 0.5], [0.5, 1.0]]],
@@ -547,7 +549,9 @@ def test_paper_loss_terms_and_weighted_total() -> None:
     assert torch.allclose(
         losses["loss_fidelity"], torch.log(torch.tensor(2.0))
     )
-    assert torch.allclose(losses["loss_distinct"], torch.tensor(0.625))
+    # Patient 0 averages (0 + sqrt(0.5)) over two visits; patient 1 has sqrt(2).
+    expected_distinct = torch.tensor(((0.5**0.5) / 2 + 2.0**0.5) / 2)
+    assert torch.allclose(losses["loss_distinct"], expected_distinct)
 
     alpha_mean = phenotype_weights.mean(dim=1, keepdim=True)
     alpha_spread = torch.linalg.vector_norm(

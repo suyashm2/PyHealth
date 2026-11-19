@@ -56,6 +56,7 @@ class SHy(BaseModel):
         num_similarity_heads: int = 10,
         num_phenotypes: int = 5,
         phenotype_temperature: float = 1.0,
+        sample_phenotypes_at_eval: bool = True,
         phenotype_code_chunk_size: int = 128,
         phenotype_attention_dim: int = 256,
         num_phenotype_attention_heads: int = 8,
@@ -123,6 +124,10 @@ class SHy(BaseModel):
         self.num_similarity_heads = num_similarity_heads
         self.num_phenotypes = num_phenotypes
         self.phenotype_temperature = float(phenotype_temperature)
+        # The authors' released code samples Gumbel masks at test time too, so
+        # evaluation sees the same kind of masks as training. False switches to
+        # deterministic thresholding at probability 0.5 during evaluation.
+        self.sample_phenotypes_at_eval = bool(sample_phenotypes_at_eval)
         self.phenotype_code_chunk_size = phenotype_code_chunk_size
         self.phenotype_attention_dim = phenotype_attention_dim
         self.num_phenotype_attention_heads = num_phenotype_attention_heads
@@ -318,6 +323,8 @@ class SHy(BaseModel):
             else:
                 try:
                     standardized = icd9cm.standardize(token)
+                    if standardized not in icd9cm:
+                        raise KeyError(f"{standardized} is not in ICD9CM")
                     # Ancestors arrive nearest-first. Reversing makes broad ICD
                     # ranges appear before narrower ranges in the hierarchy.
                     ancestors = list(icd9cm.get_ancestors(standardized))
@@ -624,22 +631,25 @@ class SHy(BaseModel):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Score all diagnosis-visit pairs and extract K sub-hypergraphs.
 
-        Equation 6 defines mask scores for every diagnosis/visit pair, including
-        pairs absent from H_augmented. Those masks are needed by SHy's distinctness
-        objective. Equation 8 then multiplies each mask by H_augmented, so only
-        existing augmented edges appear in the phenotype sub-hypergraphs.
+        Equation 6 defines mask scores for every diagnosis/visit pair. Equation 8
+        then multiplies each mask by H_augmented, so only existing augmented edges
+        appear in the phenotype sub-hypergraphs. As in the authors' code, the
+        distinctness Gram matrices are computed from these masked sub-hypergraphs,
+        so codes absent from a patient's H_augmented do not count.
 
         Pair scores are evaluated for code chunks across the batch. The first
         linear layer is factored into code and visit projections, avoiding a
         huge [B,C,V,2D] concatenation. The full mask tensor is not retained; instead,
-        ``mask_gram`` stores Gamma_j^T Gamma_j for every visit, which is the exact
-        sufficient statistic used by the paper's distinctness objective. The
+        ``mask_gram`` stores Psi_j^T Psi_j for every visit (the Gram matrix of the
+        masked links), which is all the distinctness objective needs. The
         resulting phenotype sub-hypergraphs are stored sparsely.
 
         During training, ``sample=True`` (the default) uses a hard-forward,
         straight-through Gumbel-Sigmoid sample, matching the authors' released
-        RelaxedBernoulliStraightThrough implementation. In evaluation, the default
-        is deterministic thresholding at probability 0.5.
+        RelaxedBernoulliStraightThrough implementation. In evaluation, masks are
+        also sampled by default, as in the authors' code; with
+        ``sample_phenotypes_at_eval=False`` (or ``sample=False``) they are
+        thresholded deterministically at probability 0.5 instead.
 
         Returns:
             ``(phenotype_hypergraphs, mask_gram, edge_indices)``:
@@ -677,7 +687,7 @@ class SHy(BaseModel):
             raise ValueError("valid_visits must have shape [B,V]")
 
         if sample is None:
-            sample = self.training
+            sample = self.training or getattr(self, "sample_phenotypes_at_eval", True)
 
         # valid_code_rows has shape [N]: one Boolean per code row. PAD and UNK
         # are special rows, so they are marked False instead of being diagnoses.
@@ -746,11 +756,6 @@ class SHy(BaseModel):
                 chunk_masks.dtype
             )
 
-            # Per-visit Gram: sum over code rows, retaining [B,V,K,K] for L_distinct.
-            mask_gram = mask_gram + torch.einsum(
-                "bkcv,blcv->bvkl", chunk_masks, chunk_masks
-            )
-
             # Keep mask values only where H_augmented has an edge, to form Ψ.
             # Select this code chunk's edges once for the whole batch instead of
             # rescanning the full edge table separately for every patient.
@@ -778,6 +783,19 @@ class SHy(BaseModel):
         subgraph_patients, subgraph_codes, subgraph_visits = subgraph_edge_indices.unbind(
             dim=1
         )
+
+        # Per-visit Gram matrices [B,V,K,K] for L_distinct. As in the authors'
+        # code (enriched_H *= incident_mask before the distinctness loss), only
+        # links in H_augmented count, so codes the patient does not have cannot
+        # dominate the loss. Each link adds the outer product of its K mask values.
+        if edge_mask_values.numel() > 0:
+            flat_visit_ids = subgraph_patients * num_visits + subgraph_visits
+            link_outer = edge_mask_values.unsqueeze(2) * edge_mask_values.unsqueeze(1)
+            mask_gram = (
+                mask_gram.reshape(-1, self.num_phenotypes, self.num_phenotypes)
+                .index_add(0, flat_visit_ids, link_outer)
+                .reshape_as(mask_gram)
+            )
         num_subgraph_edges = subgraph_edge_indices.size(0)
         # phenotype_ids is [K,E]: each column is one link; rows list phenotype
         # IDs 0..K-1 so every link gets one sparse coordinate per phenotype.
@@ -1077,15 +1095,16 @@ class SHy(BaseModel):
         loss_fidelity = (fidelity_per_patient / fidelity_denominator).mean()
 
         # Distinctness: mask_gram[b,v] is Gamma_v^T Gamma_v, shape [K,K].
-        # Penalize its spectral distance from identity for real visits only.
+        # Penalize its Frobenius distance from identity for real visits only
+        # (the authors' torch.norm(..., p=2) on a matrix is the Frobenius norm).
         num_phenotypes = mask_gram.size(-1)
         identity = torch.eye(
             num_phenotypes, device=mask_gram.device, dtype=mask_gram.dtype
         )
         gram_error = identity - mask_gram
         distinct_per_visit = torch.linalg.matrix_norm(
-            gram_error, ord=2, dim=(-2, -1)
-        )  # [B,V], matrix spectral norm per patient and visit
+            gram_error, ord="fro", dim=(-2, -1)
+        )  # [B,V], matrix Frobenius norm per patient and visit
         distinct_mask = valid_visits.to(
             device=distinct_per_visit.device, dtype=distinct_per_visit.dtype
         )

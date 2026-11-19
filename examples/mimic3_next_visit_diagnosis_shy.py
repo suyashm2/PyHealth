@@ -27,6 +27,9 @@ Ablations (settings the SHy paper did not test):
     --prediction-activation sigmoid
                              Sigmoid instead of softmax for SHy's output
                              scores.
+    --deterministic-eval-masks
+                             Fixed phenotype masks at test time, instead of
+                             random masks as in training (the authors' code).
     --sample-per-visit       One sample for every visit after the first,
                              instead of one sample per patient as in the paper.
 
@@ -127,7 +130,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=None,
+        help="stop after this many epochs without a better validation score",
+    )
     parser.add_argument("--sample-per-visit", action="store_true")
+    parser.add_argument(
+        "--embedding-dim",
+        type=int,
+        default=64,
+        help="SHy code embedding size (split evenly over the 4 ICD-9 levels)",
+    )
+    parser.add_argument(
+        "--hidden-dim",
+        type=int,
+        default=None,
+        help="SHy GRU and phenotype size (default: same as --embedding-dim)",
+    )
     parser.add_argument(
         "--augmentation-ratio",
         type=float,
@@ -139,6 +160,11 @@ def parse_args() -> argparse.Namespace:
         choices=["softmax", "sigmoid"],
         default="softmax",
         help="SHy output activation (the authors' code uses softmax)",
+    )
+    parser.add_argument(
+        "--deterministic-eval-masks",
+        action="store_true",
+        help="threshold SHy's phenotype masks at test time instead of sampling",
     )
     parser.add_argument("--dev", action="store_true", help="use a small subset")
     parser.add_argument("--seed", type=int, default=42)
@@ -175,8 +201,11 @@ def main() -> None:
         if model_name == "shy":
             model = SHy(
                 dataset=sample_dataset,
+                embedding_dim=args.embedding_dim,
+                hidden_dim=args.hidden_dim,
                 augmentation_ratio=args.augmentation_ratio,
                 prediction_activation=args.prediction_activation,
+                sample_phenotypes_at_eval=not args.deterministic_eval_masks,
             )
         else:
             model = MODEL_CLASSES[model_name](dataset=sample_dataset)
@@ -187,6 +216,7 @@ def main() -> None:
             epochs=args.epochs,
             optimizer_params={"lr": args.learning_rate},
             monitor="pr_auc_samples",
+            patience=args.patience,
         )
 
         # STEP 5: evaluate on the test set with the paper's metrics
