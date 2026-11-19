@@ -1,8 +1,8 @@
-"""Next-visit diagnosis prediction on MIMIC-III with PyHealth baseline models.
+"""Next-visit diagnosis prediction on MIMIC-III with SHy and baseline models.
 
-Trains RNN, RETAIN and Transformer models on the NextVisitDiagnosisMIMIC3 task
-and reports Recall@k and nDCG@k, the metrics used by the SHy paper (Yu et al.,
-CHIL 2025). These baselines are the comparison point for the SHy model.
+Trains SHy (Yu et al., CHIL 2025) and the PyHealth RNN, RETAIN and Transformer
+baselines on the NextVisitDiagnosisMIMIC3 task, and reports Recall@k and
+nDCG@k, the metrics used by the SHy paper.
 
 The pipeline follows PyHealth's five steps:
     1. Load the dataset.
@@ -15,14 +15,23 @@ By default the script uses PyHealth's public synthetic MIMIC-III data, so it
 runs without credentials. To use the real MIMIC-III 1.4 data, pass the folder
 that holds its CSV files:
 
-    python examples/mimic3_next_visit_diagnosis_baselines.py \\
+    python examples/mimic3_next_visit_diagnosis_shy.py \\
         --root /path/to/mimic-iii/1.4
 
-Use --sample-per-visit to make one sample for every visit after the first
-instead of one sample per patient.
+Use --models to train only some of the models, for example --models shy.
 
-Example output on the synthetic MIMIC-III data (2,085 samples, 20 epochs, seed
-42, one NVIDIA RTX 4070 laptop GPU, about 2 minutes):
+Ablations (settings the SHy paper did not test):
+    --augmentation-ratio 0   SHy without its false-negative augmentation,
+                             which normally adds likely missing diagnoses
+                             (default 0.2, the paper's setting).
+    --prediction-activation sigmoid
+                             Sigmoid instead of softmax for SHy's output
+                             scores.
+    --sample-per-visit       One sample for every visit after the first,
+                             instead of one sample per patient as in the paper.
+
+Example baseline output on the synthetic MIMIC-III data (2,085 samples, 20
+epochs, seed 42, one NVIDIA RTX 4070 laptop GPU, about 2 minutes):
 
     model         Recall@10    nDCG@10  Recall@20    nDCG@20
     rnn              0.2036     0.2047     0.2847     0.2268
@@ -42,9 +51,9 @@ import torch
 
 from pyhealth.datasets import MIMIC3Dataset, get_dataloader, split_by_patient
 from pyhealth.models import RETAIN, RNN, Transformer
+from pyhealth.models.SHy import SHy
 from pyhealth.tasks import NextVisitDiagnosisMIMIC3
 from pyhealth.trainer import Trainer
-from pyhealth.models.SHy import SHy
 
 SYNTHETIC_MIMIC3_ROOT = "https://storage.googleapis.com/pyhealth/Synthetic_MIMIC-III/"
 MODEL_CLASSES = {"rnn": RNN, "retain": RETAIN, "transformer": Transformer, "shy": SHy}
@@ -119,13 +128,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--sample-per-visit", action="store_true")
+    parser.add_argument(
+        "--augmentation-ratio",
+        type=float,
+        default=0.2,
+        help="SHy false-negative augmentation ratio p; 0 turns it off",
+    )
+    parser.add_argument(
+        "--prediction-activation",
+        choices=["softmax", "sigmoid"],
+        default="softmax",
+        help="SHy output activation (the authors' code uses softmax)",
+    )
     parser.add_argument("--dev", action="store_true", help="use a small subset")
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 
 
 def main() -> None:
-    """Runs the five-step pipeline for each baseline model."""
+    """Runs the five-step pipeline for each model."""
     args = parse_args()
 
     # STEP 1: load the diagnosis table
@@ -151,7 +172,14 @@ def main() -> None:
         np.random.seed(args.seed)
 
         # STEP 4: train, keeping the epoch with the best validation PR-AUC
-        model = MODEL_CLASSES[model_name](dataset=sample_dataset)
+        if model_name == "shy":
+            model = SHy(
+                dataset=sample_dataset,
+                augmentation_ratio=args.augmentation_ratio,
+                prediction_activation=args.prediction_activation,
+            )
+        else:
+            model = MODEL_CLASSES[model_name](dataset=sample_dataset)
         trainer = Trainer(model=model, metrics=["pr_auc_samples"])
         trainer.train(
             train_dataloader=train_loader,
