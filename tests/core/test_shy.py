@@ -12,7 +12,7 @@ or test ICD-9 hierarchy lookups.
 import torch
 import torch.nn as nn
 
-from pyhealth.models.SHy import SHy
+from pyhealth.models import SHy
 
 
 def make_hypergraph_builder(num_nodes: int = 6) -> SHy:

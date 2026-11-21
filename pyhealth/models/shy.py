@@ -30,6 +30,7 @@ batch of two patients, the shapes may look like::
 Input code IDs and label positions may use separate vocabularies. The hierarchy
 embedding rows are aligned to the fitted input vocabulary used by ``conditions``.
 """
+
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 import warnings
 
@@ -211,7 +212,10 @@ class SHy(BaseModel):
         #     and updated code states separate.
         # ---------------------------------------------------------------------
         self.message_layers = nn.ModuleList(
-            [nn.Linear(embedding_dim, embedding_dim) for _ in range(num_message_passing_layers)]
+            [
+                nn.Linear(embedding_dim, embedding_dim)
+                for _ in range(num_message_passing_layers)
+            ]
         )
         self.message_eps = nn.ParameterList(
             [nn.Parameter(torch.zeros(())) for _ in range(num_message_passing_layers)]
@@ -394,7 +398,9 @@ class SHy(BaseModel):
             & (codes < self.num_nodes)
         )
 
-    def _get_values_and_mask(self, value) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def _get_values_and_mask(
+        self, value
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Unpack a processor value, whose nested-sequence schema may include a mask."""
         if isinstance(value, torch.Tensor):
             return value, None
@@ -414,7 +420,8 @@ class SHy(BaseModel):
         """
         if codes.dim() != 3:
             raise ValueError(
-                f"Expected {self.feature_key} with shape [B,V,C], got {tuple(codes.shape)}"
+                f"Expected {self.feature_key} with shape [B,V,C], "
+                f"got {tuple(codes.shape)}"
             )
         codes = codes.long()
         batch_size, num_visits, _ = codes.shape
@@ -436,9 +443,7 @@ class SHy(BaseModel):
             H[batch_idx, code_ids, visit_idx] = 1.0
         return H, valid_visits
 
-    def message_passing(
-        self, H: torch.Tensor, initial_M: torch.Tensor
-    ) -> torch.Tensor:
+    def message_passing(self, H: torch.Tensor, initial_M: torch.Tensor) -> torch.Tensor:
         """Update code embeddings independently for each patient's hypergraph.
 
         Args:
@@ -500,7 +505,9 @@ class SHy(BaseModel):
             ``added_edges`` contains 1 only for newly selected connections.
         """
         if H.dim() != 3 or node_states.dim() != 3 or visit_states.dim() != 3:
-            raise ValueError("Expected H [B,N,V], node_states [B,N,D], visit_states [B,V,D]")
+            raise ValueError(
+                "Expected H [B,N,V], node_states [B,N,D], visit_states [B,V,D]"
+            )
         batch_size, num_nodes, num_visits = H.shape
         if node_states.shape[:2] != (batch_size, num_nodes):
             raise ValueError("node_states batch/code dimensions must match H")
@@ -586,9 +593,7 @@ class SHy(BaseModel):
                 ~chunk_is_valid, float("-inf")
             ).reshape(batch_size, -1)
             local_k = min(max_add_count, chunk_scores.size(1))
-            local_scores, local_indices = torch.topk(
-                chunk_scores, k=local_k, dim=1
-            )
+            local_scores, local_indices = torch.topk(chunk_scores, k=local_k, dim=1)
             # Convert this chunk's flattened [code,visit] offsets to offsets in
             # the patient's full [N,V] matrix.
             local_indices = local_indices + code_start * num_visits
@@ -599,9 +604,7 @@ class SHy(BaseModel):
                 merged_scores = torch.cat([best_scores, local_scores], dim=1)
                 merged_indices = torch.cat([best_indices, local_indices], dim=1)
                 keep_k = min(max_add_count, merged_scores.size(1))
-                best_scores, best_positions = torch.topk(
-                    merged_scores, k=keep_k, dim=1
-                )
+                best_scores, best_positions = torch.topk(merged_scores, k=keep_k, dim=1)
                 best_indices = torch.gather(merged_indices, 1, best_positions)
 
         # The batch top-k width is the maximum requested across patients; mask
@@ -611,9 +614,7 @@ class SHy(BaseModel):
             < add_counts[:, None]
         )
         added_flat = H.new_zeros((batch_size, num_nodes * num_visits))
-        added_flat.scatter_(
-            1, best_indices, rank_is_selected.to(added_flat.dtype)
-        )
+        added_flat.scatter_(1, best_indices, rank_is_selected.to(added_flat.dtype))
         added_edges = added_flat.reshape(batch_size, num_nodes, num_visits)
 
         # STEP 5e — Union the original incidence links with the new links.
@@ -673,7 +674,9 @@ class SHy(BaseModel):
         if node_states.shape[:2] != (batch_size, num_nodes):
             raise ValueError("node_states batch/code dimensions must match H_augmented")
         if visit_states.shape[:2] != (batch_size, num_visits):
-            raise ValueError("visit_states batch/visit dimensions must match H_augmented")
+            raise ValueError(
+                "visit_states batch/visit dimensions must match H_augmented"
+            )
         if node_states.size(-1) != visit_states.size(-1):
             raise ValueError("Diagnosis and visit embedding dimensions must match")
 
@@ -691,7 +694,9 @@ class SHy(BaseModel):
 
         # valid_code_rows has shape [N]: one Boolean per code row. PAD and UNK
         # are special rows, so they are marked False instead of being diagnoses.
-        valid_code_rows = torch.ones(num_nodes, dtype=torch.bool, device=H_augmented.device)
+        valid_code_rows = torch.ones(
+            num_nodes, dtype=torch.bool, device=H_augmented.device
+        )
         if 0 <= self.pad_idx < num_nodes:
             valid_code_rows[self.pad_idx] = False
         if 0 <= self.unk_idx < num_nodes:
@@ -699,7 +704,9 @@ class SHy(BaseModel):
 
         # STEP 6a — Find augmented edges once. These are the only coordinates
         # that can survive the final multiplication by H_augmented (Eq. 8).
-        edge_indices = (H_augmented > 0).nonzero(as_tuple=False)  # [E,3]: b, code, visit
+        edge_indices = (H_augmented > 0).nonzero(
+            as_tuple=False
+        )  # [E,3]: b, code, visit
         # Keep code IDs for chunk selection; full coordinates are gathered later.
         edge_codes = edge_indices[:, 1]
 
@@ -752,9 +759,7 @@ class SHy(BaseModel):
                 valid_code_rows[code_start:code_end][None, :, None]
                 & valid_visits[:, None, :]
             )  # [B,C,V], broadcast across phenotype axis K
-            chunk_masks = chunk_masks * valid_pair[:, None, :, :].to(
-                chunk_masks.dtype
-            )
+            chunk_masks = chunk_masks * valid_pair[:, None, :, :].to(chunk_masks.dtype)
 
             # Keep mask values only where H_augmented has an edge, to form Ψ.
             # Select this code chunk's edges once for the whole batch instead of
@@ -780,8 +785,8 @@ class SHy(BaseModel):
                 (0, 3), dtype=torch.long, device=H_augmented.device
             )
             edge_mask_values = node_states.new_empty((0, self.num_phenotypes))
-        subgraph_patients, subgraph_codes, subgraph_visits = subgraph_edge_indices.unbind(
-            dim=1
+        subgraph_patients, subgraph_codes, subgraph_visits = (
+            subgraph_edge_indices.unbind(dim=1)
         )
 
         # Per-visit Gram matrices [B,V,K,K] for L_distinct. As in the authors'
@@ -799,9 +804,11 @@ class SHy(BaseModel):
         num_subgraph_edges = subgraph_edge_indices.size(0)
         # phenotype_ids is [K,E]: each column is one link; rows list phenotype
         # IDs 0..K-1 so every link gets one sparse coordinate per phenotype.
-        phenotype_ids = torch.arange(
-            self.num_phenotypes, device=H_augmented.device
-        ).unsqueeze(1).expand(-1, num_subgraph_edges)
+        phenotype_ids = (
+            torch.arange(self.num_phenotypes, device=H_augmented.device)
+            .unsqueeze(1)
+            .expand(-1, num_subgraph_edges)
+        )
         # Build sparse coordinate rows in matching K-major order:
         # [patient, phenotype, code, visit], one column per stored value.
         sparse_indices = torch.stack(
@@ -810,9 +817,7 @@ class SHy(BaseModel):
                 .expand(self.num_phenotypes, -1)
                 .reshape(-1),
                 phenotype_ids.reshape(-1),
-                subgraph_codes.unsqueeze(0)
-                .expand(self.num_phenotypes, -1)
-                .reshape(-1),
+                subgraph_codes.unsqueeze(0).expand(self.num_phenotypes, -1).reshape(-1),
                 subgraph_visits.unsqueeze(0)
                 .expand(self.num_phenotypes, -1)
                 .reshape(-1),
@@ -860,11 +865,15 @@ class SHy(BaseModel):
         if phenotype_hypergraphs.layout != torch.sparse_coo:
             raise ValueError("phenotype_hypergraphs must use sparse COO layout")
         if phenotype_hypergraphs.dim() != 4 or node_states.dim() != 3:
-            raise ValueError("Expected phenotype graphs [B,K,N,V] and node_states [B,N,D]")
+            raise ValueError(
+                "Expected phenotype graphs [B,K,N,V] and node_states [B,N,D]"
+            )
 
         batch_size, num_phenotypes, num_nodes, num_visits = phenotype_hypergraphs.shape
         if node_states.shape[:2] != (batch_size, num_nodes):
-            raise ValueError("node_states batch/code dimensions must match phenotype graphs")
+            raise ValueError(
+                "node_states batch/code dimensions must match phenotype graphs"
+            )
         if node_states.size(-1) != self.phenotype_gru.input_size:
             raise ValueError("node_states embedding width must match the phenotype GRU")
 
@@ -877,13 +886,12 @@ class SHy(BaseModel):
             (batch_size * num_phenotypes * num_visits, node_states.size(-1))
         )
         if edge_values.numel() > 0 and num_visits > 0:
-            edge_patients, edge_phenotypes, edge_codes, edge_visits = edge_coordinates.unbind(
-                dim=0
+            edge_patients, edge_phenotypes, edge_codes, edge_visits = (
+                edge_coordinates.unbind(dim=0)
             )
             flat_visit_ids = (
-                (edge_patients * num_phenotypes + edge_phenotypes) * num_visits
-                + edge_visits
-            )
+                edge_patients * num_phenotypes + edge_phenotypes
+            ) * num_visits + edge_visits
             selected_code_states = node_states[edge_patients, edge_codes]
             weighted_code_states = selected_code_states * edge_values.unsqueeze(-1)
             visit_sums = visit_sums.index_add(0, flat_visit_ids, weighted_code_states)
@@ -916,9 +924,11 @@ class SHy(BaseModel):
         flattened_sequences = phenotype_visit_embeddings.reshape(
             batch_size * num_phenotypes, num_visits, node_states.size(-1)
         )
-        flattened_visit_mask = valid_visits[:, None, :].expand(
-            batch_size, num_phenotypes, num_visits
-        ).reshape(batch_size * num_phenotypes, num_visits)
+        flattened_visit_mask = (
+            valid_visits[:, None, :]
+            .expand(batch_size, num_phenotypes, num_visits)
+            .reshape(batch_size * num_phenotypes, num_visits)
+        )
 
         if num_visits == 0:
             visit_hidden_states = node_states.new_zeros(
@@ -945,9 +955,10 @@ class SHy(BaseModel):
             flat_attention_weights = flat_attention_weights * flattened_visit_mask.to(
                 flat_attention_weights.dtype
             )
-            flat_attention_weights = flat_attention_weights / flat_attention_weights.sum(
-                dim=-1, keepdim=True
-            ).clamp_min(1e-8)
+            flat_attention_weights = (
+                flat_attention_weights
+                / flat_attention_weights.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+            )
 
         # Attention weights sum the GRU outputs across time into one vector per
         # phenotype. Invalid visits get zero weight; empty histories yield zero.
@@ -1079,7 +1090,9 @@ class SHy(BaseModel):
         # and code vocabulary, then average patients (including empty histories
         # as zero contribution rather than producing NaN).
         if reconstruction_logits.shape != original_H.shape:
-            raise ValueError("reconstruction logits must have the same [B,N,V] shape as H")
+            raise ValueError(
+                "reconstruction logits must have the same [B,N,V] shape as H"
+            )
         valid_visits = valid_visits.to(device=original_H.device, dtype=torch.bool)
         reconstruction_targets = original_H.to(
             device=reconstruction_logits.device, dtype=reconstruction_logits.dtype
@@ -1145,7 +1158,6 @@ class SHy(BaseModel):
         # above to create code_level_node_ids and therefore the rows of M.
         codes, _processor_mask = self._get_values_and_mask(kwargs[self.feature_key])
         codes = codes.to(self.device).long()
-        batch_size = codes.size(0)
 
         # STEP 2 — Build each patient's incidence matrix H from history codes.
         H, _valid_visits = self.construct_initial_hypergraph(codes)
