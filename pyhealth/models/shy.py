@@ -44,7 +44,38 @@ from pyhealth.models import BaseModel
 
 
 class SHy(BaseModel):
-    """Predict multi-label next-visit diagnoses from nested diagnosis histories."""
+    """Predict multi-label next-visit diagnoses from nested diagnosis histories.
+
+    Examples:
+        >>> from pyhealth.datasets import create_sample_dataset, get_dataloader
+        >>> from pyhealth.models import SHy
+        >>> samples = [
+        ...     {
+        ...         "patient_id": "patient-0",
+        ...         "visit_id": "visit-2",
+        ...         "conditions": [["4019", "25000"], ["4280", "4019"]],
+        ...         "next_conditions": ["4280", "42731"],
+        ...     },
+        ...     {
+        ...         "patient_id": "patient-1",
+        ...         "visit_id": "visit-1",
+        ...         "conditions": [["486", "5849"]],
+        ...         "next_conditions": ["486"],
+        ...     },
+        ... ]
+        >>> dataset = create_sample_dataset(
+        ...     samples=samples,
+        ...     input_schema={"conditions": "nested_sequence"},
+        ...     output_schema={"next_conditions": "multilabel"},
+        ...     dataset_name="test",
+        ... )
+        >>> model = SHy(dataset=dataset, embedding_dim=32)
+        >>> loader = get_dataloader(dataset, batch_size=2, shuffle=False)
+        >>> output = model(**next(iter(loader)))
+        >>> output["y_prob"].shape  # 2 patients, 3 possible next-visit codes
+        torch.Size([2, 3])
+        >>> output["loss"].backward()  # total of SHy's four training losses
+    """
 
     def __init__(
         self,

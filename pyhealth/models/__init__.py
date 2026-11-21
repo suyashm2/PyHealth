@@ -57,4 +57,4 @@ from .generators.medgan import MedGAN
 from .generators.synthea import Synthea as Synthea
 from .generators.corgan import CorGAN as CorGAN
 from .survival_mdn import SurvivalMDN as SurvivalMDN
-from .shy import SHy
+from .shy import SHy as SHy
