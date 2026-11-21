@@ -54,7 +54,7 @@ import torch
 
 from pyhealth.datasets import MIMIC3Dataset, get_dataloader, split_by_patient
 from pyhealth.models import RETAIN, RNN, Transformer
-from pyhealth.models.SHy import SHy
+from pyhealth.models import SHy
 from pyhealth.tasks import NextVisitDiagnosisMIMIC3
 from pyhealth.trainer import Trainer
 
