@@ -33,6 +33,11 @@ Ablations (settings the SHy paper did not test):
     --sample-per-visit       One sample for every visit after the first,
                              instead of one sample per patient as in the paper.
 
+Learning-rate schedule (PyHealth's Trainer keeps the rate fixed):
+    --lr-schedule plateau    Multiply the learning rate by --lr-decay-factor
+                             whenever the validation score has not improved
+                             for --lr-decay-patience epochs.
+
 Example baseline output on the synthetic MIMIC-III data (2,085 samples, 20
 epochs, seed 42, one NVIDIA RTX 4070 laptop GPU, about 2 minutes):
 
@@ -120,6 +125,47 @@ def ndcg_at_k(y_true: np.ndarray, y_prob: np.ndarray, k: int) -> float:
     return float(np.mean(scores))
 
 
+class PlateauTrainer(Trainer):
+    """Trainer that lowers the learning rate when the validation score stalls.
+
+    PyHealth's Trainer has no learning-rate schedule. This subclass builds the
+    Adam optimizer itself (pass make_optimizer as optimizer_class) and steps a
+    ReduceLROnPlateau scheduler after each validation pass.
+    """
+
+    def __init__(self, *args, val_loader, monitor, factor, patience, min_lr, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.val_loader = val_loader  # only validation passes step the schedule
+        self.monitor = monitor  # validation score to watch, e.g. pr_auc_samples
+        self.factor = factor  # multiply the learning rate by this when stuck
+        self.patience = patience  # epochs without improvement before lowering
+        self.min_lr = min_lr  # never go below this learning rate
+        self.scheduler = None  # created together with the optimizer
+
+    def make_optimizer(self, params, **optimizer_params):
+        """Builds Adam and the scheduler that will adjust its learning rate."""
+        optimizer = torch.optim.Adam(params, **optimizer_params)
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="max",
+            factor=self.factor,
+            patience=self.patience,
+            min_lr=self.min_lr,
+        )
+        return optimizer
+
+    def evaluate(self, dataloader):
+        """Evaluates as usual, then updates the schedule on validation passes."""
+        scores = super().evaluate(dataloader)
+        if self.scheduler is not None and dataloader is self.val_loader:
+            old_lr = self.scheduler.optimizer.param_groups[0]["lr"]
+            self.scheduler.step(scores[self.monitor])
+            new_lr = self.scheduler.optimizer.param_groups[0]["lr"]
+            if new_lr < old_lr:
+                print(f"Learning rate lowered from {old_lr:.2e} to {new_lr:.2e}")
+        return scores
+
+
 def parse_args() -> argparse.Namespace:
     """Reads the command-line options."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -135,6 +181,33 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="stop after this many epochs without a better validation score",
+    )
+    parser.add_argument(
+        "--max-grad-norm",
+        type=float,
+        default=None,
+        help="clip gradients to this norm (default: no clipping)",
+    )
+    parser.add_argument(
+        "--lr-schedule",
+        choices=["none", "plateau"],
+        default="none",
+        help="plateau: lower the learning rate when validation stops improving",
+    )
+    parser.add_argument(
+        "--lr-decay-factor",
+        type=float,
+        default=0.5,
+        help="multiply the learning rate by this when it is lowered",
+    )
+    parser.add_argument(
+        "--lr-decay-patience",
+        type=int,
+        default=3,
+        help="epochs without improvement before the learning rate is lowered",
+    )
+    parser.add_argument(
+        "--min-lr", type=float, default=1e-5, help="lowest learning rate allowed"
     )
     parser.add_argument("--sample-per-visit", action="store_true")
     parser.add_argument(
@@ -167,7 +240,15 @@ def parse_args() -> argparse.Namespace:
         help="threshold SHy's phenotype masks at test time instead of sampling",
     )
     parser.add_argument("--dev", action="store_true", help="use a small subset")
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--seed", type=int, default=42, help="seed for model weights and batches"
+    )
+    parser.add_argument(
+        "--split-seed",
+        type=int,
+        default=42,
+        help="seed for the train/validation/test split (keep fixed to compare runs)",
+    )
     return parser.parse_args()
 
 
@@ -186,7 +267,7 @@ def main() -> None:
 
     # STEP 3: split by patient, so no patient is in more than one set
     train_dataset, val_dataset, test_dataset = split_by_patient(
-        sample_dataset, [0.7, 0.1, 0.2], seed=args.seed
+        sample_dataset, [0.7, 0.1, 0.2], seed=args.split_seed
     )
     train_loader = get_dataloader(train_dataset, args.batch_size, shuffle=True)
     val_loader = get_dataloader(val_dataset, args.batch_size, shuffle=False)
@@ -209,14 +290,29 @@ def main() -> None:
             )
         else:
             model = MODEL_CLASSES[model_name](dataset=sample_dataset)
-        trainer = Trainer(model=model, metrics=["pr_auc_samples"])
+        if args.lr_schedule == "plateau":
+            trainer = PlateauTrainer(
+                model=model,
+                metrics=["pr_auc_samples"],
+                val_loader=val_loader,
+                monitor="pr_auc_samples",
+                factor=args.lr_decay_factor,
+                patience=args.lr_decay_patience,
+                min_lr=args.min_lr,
+            )
+            optimizer_class = trainer.make_optimizer
+        else:
+            trainer = Trainer(model=model, metrics=["pr_auc_samples"])
+            optimizer_class = torch.optim.Adam
         trainer.train(
             train_dataloader=train_loader,
             val_dataloader=val_loader,
             epochs=args.epochs,
+            optimizer_class=optimizer_class,
             optimizer_params={"lr": args.learning_rate},
             monitor="pr_auc_samples",
             patience=args.patience,
+            max_grad_norm=args.max_grad_norm,
         )
 
         # STEP 5: evaluate on the test set with the paper's metrics
