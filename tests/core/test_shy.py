@@ -1,14 +1,15 @@
 """Small synthetic check for SHy's patient-isolated hypergraph construction.
 
 Run from this directory with either:
-    python test_shy_hypergraph.py
-    python -m pytest test_shy_hypergraph.py
+    python test_shy.py
+    python -m pytest test_shy.py
 
 These synthetic checks cover incidence construction, message passing,
 augmentation, phenotype extraction and embedding, prediction, and the four
 terms in SHy's paper objective. They do not initialize a full PyHealth dataset
 or test ICD-9 hierarchy lookups.
 """
+
 import torch
 import torch.nn as nn
 
@@ -66,9 +67,7 @@ def make_phenotype_extraction_model(num_nodes: int = 7, num_phenotypes: int = 3)
     return model
 
 
-def make_temporal_embedding_model(
-    embedding_dim: int = 2, hidden_dim: int = 3
-) -> SHy:
+def make_temporal_embedding_model(embedding_dim: int = 2, hidden_dim: int = 3) -> SHy:
     """Create the GRU and temporal-attention modules without a real dataset."""
     model = make_hypergraph_builder(num_nodes=4)
     model.num_phenotypes = 2
@@ -263,6 +262,79 @@ def test_missing_diagnosis_augmentation_adds_only_valid_patient_local_edges() ->
     print("New edges per patient:", added_edges.sum(dim=(1, 2)).tolist())
 
 
+def test_sparse_phenotype_scoring_matches_full_grid_reference() -> None:
+    """Sparse edge scoring must match the previous full-grid calculation."""
+    torch.manual_seed(2026)
+    H_augmented = torch.zeros((2, 7, 3), dtype=torch.float32)
+    H_augmented[0, 2, 0] = 1.0
+    H_augmented[0, 3, 0] = 1.0
+    H_augmented[0, 4, 1] = 1.0
+    H_augmented[1, 5, 0] = 1.0
+    H_augmented[1, 6, 1] = 1.0
+    H_augmented[1, 2, 1] = 1.0
+    node_states = torch.randn((2, 7, 2))
+    visit_states = torch.randn((2, 3, 2))
+    model = make_phenotype_extraction_model(num_phenotypes=3)
+    model.eval()
+
+    # New implementation: only links in H_augmented are passed through the MLPs.
+    sparse_graphs, sparse_gram, sparse_edges = model.extract_phenotypes(
+        H_augmented, node_states, visit_states, sample=False
+    )
+
+    # Reference implementation: reproduce the previous dense code-by-visit
+    # scoring, then apply the same H~ mask used to form phenotype subgraphs.
+    full_grid_logits = []
+    for extractor in model.phenotype_extractors:
+        first_linear, activation, output_linear = extractor
+        code_hidden = torch.nn.functional.linear(
+            node_states, first_linear.weight[:, : node_states.size(-1)]
+        )
+        visit_hidden = torch.nn.functional.linear(
+            visit_states,
+            first_linear.weight[:, node_states.size(-1) :],
+            first_linear.bias,
+        )
+        pair_hidden = activation(
+            code_hidden[:, :, None, :] + visit_hidden[:, None, :, :]
+        )
+        full_grid_logits.append(output_linear(pair_hidden).squeeze(-1))
+
+    full_grid_logits = torch.stack(full_grid_logits, dim=1)  # [B,K,N,V]
+    full_grid_masks = (full_grid_logits >= 0).to(H_augmented.dtype)
+    valid_code_rows = torch.ones(7, dtype=torch.bool)
+    valid_code_rows[model.pad_idx] = False
+    valid_code_rows[model.unk_idx] = False
+    valid_visits = H_augmented.sum(dim=1) > 0
+    valid_pairs = valid_code_rows[None, :, None] & valid_visits[:, None, :]
+    full_grid_masks = full_grid_masks * valid_pairs[:, None].to(H_augmented.dtype)
+    reference_graphs = H_augmented[:, None] * full_grid_masks
+    reference_gram = torch.einsum("bkcv,blcv->bvkl", reference_graphs, reference_graphs)
+    reference_edges = (H_augmented > 0).nonzero(as_tuple=False)
+
+    # The fixture has more valid diagnosis-visit combinations than graph links.
+    num_valid_pairs = int(
+        (valid_code_rows[None, :, None] & valid_visits[:, None, :]).sum().item()
+    )
+    assert reference_edges.size(0) < num_valid_pairs
+
+    # Chunking changes coordinate order, so compare sorted linear coordinates.
+    def sort_edge_coordinates(coordinates: torch.Tensor) -> torch.Tensor:
+        edge_keys = (
+            coordinates[:, 0] * H_augmented.size(1) * H_augmented.size(2)
+            + coordinates[:, 1] * H_augmented.size(2)
+            + coordinates[:, 2]
+        )
+        return coordinates[edge_keys.argsort()]
+
+    assert torch.equal(
+        sort_edge_coordinates(sparse_edges), sort_edge_coordinates(reference_edges)
+    )
+    torch.testing.assert_close(sparse_graphs.to_dense(), reference_graphs)
+    torch.testing.assert_close(sparse_gram, reference_gram)
+    print("Sparse phenotype scoring matches the full-grid reference.")
+
+
 def test_phenotype_extraction_masks_only_augmented_patient_edges() -> None:
     # Build a tiny augmented graph: two patients, seven code rows, three visits.
     # Visit 2 is padding for both patients; code rows 0 and 1 are PAD and UNK.
@@ -274,8 +346,8 @@ def test_phenotype_extraction_masks_only_augmented_patient_edges() -> None:
     H_augmented[1, 6, 1] = 1.0
     H_augmented[1, 2, 1] = 1.0  # Added/selected diagnosis for patient 1.
 
-    # Give each diagnosis and visit a small, two-feature embedding. The MLPs score
-    # every valid code/visit pair, but only H~ links can survive as subgraph edges.
+    # Give each diagnosis and visit a small, two-feature embedding. The optimized
+    # MLP scoring evaluates only the existing H~ diagnosis-visit links.
     node_states = torch.randn((2, 7, 2), dtype=torch.float32)
     visit_states = torch.randn((2, 3, 2), dtype=torch.float32)
     model = make_phenotype_extraction_model(num_phenotypes=3)
@@ -314,9 +386,11 @@ def test_phenotype_extraction_masks_only_augmented_patient_edges() -> None:
         mask_gram, links_per_visit[:, :, None, None].expand_as(mask_gram)
     )
     assert torch.all(mask_gram[:, 2] == 0.0)
-    # Those full-grid masks are filtered by H~: with all-one masks, each phenotype
-    # subgraph must exactly match its patient's augmented incidence matrix.
-    assert torch.equal(dense_phenotypes, H_augmented.unsqueeze(1).expand_as(dense_phenotypes))
+    # With all-one masks on existing links, each phenotype subgraph must exactly
+    # match its patient's augmented incidence matrix.
+    assert torch.equal(
+        dense_phenotypes, H_augmented.unsqueeze(1).expand_as(dense_phenotypes)
+    )
 
     # PAD/UNK rows and padded visit columns were absent from H~, so they must
     # remain absent from every one of the K phenotype-specific sub-hypergraphs.
@@ -464,9 +538,9 @@ def test_phenotype_attention_and_softmax_sigmoid_prediction_switch() -> None:
     assert torch.allclose(
         per_phenotype_softmax.sum(dim=-1), torch.ones((2, 3)), atol=1e-6
     )
-    expected_softmax_prediction = (
-        alpha.unsqueeze(-1) * per_phenotype_softmax
-    ).sum(dim=1)
+    expected_softmax_prediction = (alpha.unsqueeze(-1) * per_phenotype_softmax).sum(
+        dim=1
+    )
     assert torch.allclose(softmax_prediction, expected_softmax_prediction)
     assert torch.allclose(softmax_prediction.sum(dim=-1), torch.ones(2), atol=1e-6)
 
@@ -501,9 +575,7 @@ def test_paper_loss_terms_and_weighted_total() -> None:
     # Two patients, three input diagnosis codes, and two history visits.
     # Visit masks mark the second patient's second column as padding.
     model = make_loss_model()
-    prediction_probs = torch.tensor(
-        [[0.8, 0.2], [0.25, 0.75]], requires_grad=True
-    )
+    prediction_probs = torch.tensor([[0.8, 0.2], [0.25, 0.75]], requires_grad=True)
     labels = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
     original_H = torch.tensor(
         [
@@ -525,9 +597,7 @@ def test_paper_loss_terms_and_weighted_total() -> None:
         ],
         requires_grad=True,
     )
-    phenotype_weights = torch.tensor(
-        [[0.5, 0.5], [0.8, 0.2]], requires_grad=True
-    )
+    phenotype_weights = torch.tensor([[0.5, 0.5], [0.8, 0.2]], requires_grad=True)
 
     losses = model.compute_paper_losses(
         prediction_probs,
@@ -540,23 +610,19 @@ def test_paper_loss_terms_and_weighted_total() -> None:
     )
 
     # Prediction term: ordinary elementwise BCE, matching the paper's formula.
-    expected_pred = torch.nn.functional.binary_cross_entropy(
-        prediction_probs, labels
-    )
+    expected_pred = torch.nn.functional.binary_cross_entropy(prediction_probs, labels)
     assert torch.allclose(losses["loss_pred"], expected_pred)
     # Zero reconstruction logits predict 0.5 everywhere, so BCE is ln(2).
     # Fidelity ignores the padded visit but averages each patient's valid cells.
-    assert torch.allclose(
-        losses["loss_fidelity"], torch.log(torch.tensor(2.0))
-    )
+    assert torch.allclose(losses["loss_fidelity"], torch.log(torch.tensor(2.0)))
     # Patient 0 averages (0 + sqrt(0.5)) over two visits; patient 1 has sqrt(2).
     expected_distinct = torch.tensor(((0.5**0.5) / 2 + 2.0**0.5) / 2)
     assert torch.allclose(losses["loss_distinct"], expected_distinct)
 
     alpha_mean = phenotype_weights.mean(dim=1, keepdim=True)
-    alpha_spread = torch.linalg.vector_norm(
-        phenotype_weights - alpha_mean, dim=1
-    ) / (2.0 ** 0.5)
+    alpha_spread = torch.linalg.vector_norm(phenotype_weights - alpha_mean, dim=1) / (
+        2.0**0.5
+    )
     alpha_norm = torch.linalg.vector_norm(phenotype_weights, dim=1)
     expected_alpha = -(alpha_spread - alpha_norm).mean()
     assert torch.allclose(losses["loss_alpha"], expected_alpha)
@@ -607,6 +673,7 @@ if __name__ == "__main__":
     test_patient_blocks_are_separate()
     test_message_passing_updates_codes_without_cross_patient_mixing()
     test_missing_diagnosis_augmentation_adds_only_valid_patient_local_edges()
+    test_sparse_phenotype_scoring_matches_full_grid_reference()
     test_phenotype_extraction_masks_only_augmented_patient_edges()
     test_phenotype_visit_embeddings_and_temporal_attention()
     test_phenotype_attention_and_softmax_sigmoid_prediction_switch()
