@@ -232,7 +232,7 @@ class SHy(BaseModel):
             [nn.Embedding(size, self.per_level_dim) for size in level_vocab_sizes]
         )
         for table in self.hierarchy_embeddings:
-            nn.init.normal_(table.weight, mean=0.0, std=0.02)
+            nn.init.normal_(table.weight, mean=0.0, std=1)
 
         # ---------------------------------------------------------------------
         # STEP 4 — Set up patient-specific UniGIN-style message passing.
