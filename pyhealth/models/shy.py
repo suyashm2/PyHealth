@@ -46,6 +46,60 @@ from pyhealth.models import BaseModel
 class SHy(BaseModel):
     """Predict multi-label next-visit diagnoses from nested diagnosis histories.
 
+    SHy (Yu et al., CHIL 2025) builds a hypergraph for each patient, with
+    diagnosis codes as nodes and visits as hyperedges. It adds likely missing
+    code-visit links, extracts K temporal phenotypes (subgraphs), and predicts
+    the next visit's diagnoses from a weighted mix of per-phenotype
+    predictions. Paper: https://proceedings.mlr.press/v287/yu25a.html
+
+    Args:
+        dataset: Fitted sample dataset with one nested diagnosis-code input
+            (for example ``conditions``) and one multilabel next-visit label.
+        embedding_dim: Width of each diagnosis-code embedding. Must be
+            divisible by ``num_hierarchy_levels``. Default 64.
+        hidden_dim: Width of the message-passing, phenotype-mask, GRU and
+            attention layers. ``None`` uses ``embedding_dim``. Default None.
+        num_hierarchy_levels: Number of ICD-9 hierarchy levels whose
+            embeddings are concatenated into each code embedding (chapter,
+            section, category, full code). Only 4 is supported. Default 4.
+        num_message_passing_layers: Number of UniGIN message-passing layers
+            over each patient's hypergraph. Default 2.
+        augmentation_ratio: Fraction of each patient's existing code-visit
+            links to add as likely missing links before phenotype extraction.
+            0 turns augmentation off. Default 0.2.
+        num_similarity_heads: Number of random projection heads used to score
+            candidate missing links during augmentation. Default 10.
+        num_phenotypes: Number of temporal phenotypes K extracted per
+            patient. Default 5.
+        phenotype_temperature: Gumbel-softmax temperature for the phenotype
+            masks. Default 1.0.
+        sample_phenotypes_at_eval: If True, sample random phenotype masks at
+            evaluation as in training (the authors' code). If False,
+            threshold the mask probabilities at 0.5 instead. Default True.
+        phenotype_code_chunk_size: Number of codes scored at once when
+            building phenotype masks; lower values use less memory and do not
+            change results. Default 128.
+        phenotype_attention_dim: Width of the self-attention over phenotype
+            embeddings. Must be divisible by ``num_phenotype_attention_heads``.
+            Default 256.
+        num_phenotype_attention_heads: Number of heads in the phenotype
+            self-attention. Default 8.
+        prediction_activation: ``"softmax"`` (the paper) or ``"sigmoid"`` for
+            the per-phenotype diagnosis predictions. Default ``"softmax"``.
+        fidelity_loss_weight: Weight of the loss for rebuilding the original
+            hypergraph from the phenotypes. Default 0.003.
+        distinct_loss_weight: Weight of the loss that keeps phenotypes
+            different from each other. Default 0.00025.
+        alpha_loss_weight: Weight of the regularizer that keeps the phenotype
+            mixing weights from collapsing onto one phenotype. Default 0.04.
+        embedding_init_std: Standard deviation of the normal distribution
+            used to initialize the hierarchy embedding tables. Default 1.0,
+            as in the authors' code.
+
+    Raises:
+        ValueError: If a setting is out of range, or if the dataset does not
+            have exactly one input feature and one label.
+
     Examples:
         >>> from pyhealth.datasets import create_sample_dataset, get_dataloader
         >>> from pyhealth.models import SHy
