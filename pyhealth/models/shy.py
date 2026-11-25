@@ -97,6 +97,8 @@ class SHy(BaseModel):
         fidelity_loss_weight: float = 0.003,
         distinct_loss_weight: float = 0.00025,
         alpha_loss_weight: float = 0.04,
+        # Authors' code: nn.Embedding default init, N(0, 1).
+        embedding_init_std: float = 1.0,
     ) -> None:
         super().__init__(dataset=dataset)
         if len(self.feature_keys) != 1:
@@ -117,6 +119,8 @@ class SHy(BaseModel):
             raise ValueError("num_message_passing_layers must be positive")
         if augmentation_ratio < 0:
             raise ValueError("augmentation_ratio must be non-negative")
+        if embedding_init_std <= 0:
+            raise ValueError("embedding_init_std must be positive")
         if num_similarity_heads <= 0:
             raise ValueError("num_similarity_heads must be positive")
         if num_phenotypes <= 0:
@@ -232,7 +236,7 @@ class SHy(BaseModel):
             [nn.Embedding(size, self.per_level_dim) for size in level_vocab_sizes]
         )
         for table in self.hierarchy_embeddings:
-            nn.init.normal_(table.weight, mean=0.0, std=1)
+            nn.init.normal_(table.weight, mean=0.0, std=embedding_init_std)
 
         # ---------------------------------------------------------------------
         # STEP 4 — Set up patient-specific UniGIN-style message passing.

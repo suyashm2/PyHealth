@@ -20,6 +20,14 @@ that holds its CSV files:
 
 Use --models to train only some of the models, for example --models shy.
 
+Settings for SHy on real MIMIC-III (the default learning rate of 1e-3 is too
+high for SHy there and makes training unstable):
+
+    python examples/mimic3_next_visit_diagnosis_shy.py \\
+        --root /path/to/mimic-iii/1.4 --models shy \\
+        --embedding-dim 128 --hidden-dim 128 --batch-size 64 \\
+        --learning-rate 3e-4 --max-grad-norm 5 --epochs 100 --patience 15
+
 Ablations (settings the SHy paper did not test):
     --augmentation-ratio 0   SHy without its false-negative augmentation,
                              which normally adds likely missing diagnoses
@@ -32,6 +40,15 @@ Ablations (settings the SHy paper did not test):
                              random masks as in training (the authors' code).
     --sample-per-visit       One sample for every visit after the first,
                              instead of one sample per patient as in the paper.
+    --alpha-loss-weight 0    SHy without its alpha regularizer, which keeps
+                             the phenotype weights from collapsing onto one
+                             phenotype (default 0.04, from the paper's table;
+                             the authors' released run command uses 0).
+    --embedding-init-std 0.02
+                             Smaller starting weights for the code
+                             embeddings (default 1.0, as in the authors'
+                             code). On MIMIC-III this lowered Recall@20 by
+                             about 2.9 points (.333 vs .362).
 
 Learning-rate schedule (PyHealth's Trainer keeps the rate fixed):
     --lr-schedule plateau    Multiply the learning rate by --lr-decay-factor
@@ -235,6 +252,18 @@ def parse_args() -> argparse.Namespace:
         help="SHy output activation (the authors' code uses softmax)",
     )
     parser.add_argument(
+        "--alpha-loss-weight",
+        type=float,
+        default=0.04,
+        help="weight of SHy's alpha regularizer; 0 turns it off",
+    )
+    parser.add_argument(
+        "--embedding-init-std",
+        type=float,
+        default=1.0,
+        help="standard deviation of SHy's starting code-embedding weights",
+    )
+    parser.add_argument(
         "--deterministic-eval-masks",
         action="store_true",
         help="threshold SHy's phenotype masks at test time instead of sampling",
@@ -287,6 +316,8 @@ def main() -> None:
                 augmentation_ratio=args.augmentation_ratio,
                 prediction_activation=args.prediction_activation,
                 sample_phenotypes_at_eval=not args.deterministic_eval_masks,
+                alpha_loss_weight=args.alpha_loss_weight,
+                embedding_init_std=args.embedding_init_std,
             )
         else:
             model = MODEL_CLASSES[model_name](dataset=sample_dataset)
