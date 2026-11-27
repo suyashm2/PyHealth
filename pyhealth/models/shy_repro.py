@@ -366,7 +366,9 @@ class SHyRepro(BaseModel):
         # The same diagnosis classifier is applied to each U_k, then the per-
         # phenotype predictions are mixed using alpha. `prediction_activation`
         # selects the paper's softmax or the sigmoid ablation.
-        self.diagnosis_classifier = nn.Linear(hidden_dim, self.get_output_size())
+        self.diagnosis_classifier = nn.Linear(
+            hidden_dim, self.label_processor.output_size()
+        )
 
         # STEP 10 — Reconstruct the original [code, visit] patient graph.
         # Appendix C concatenates U_1..U_K and repeats that same context vector
@@ -1305,7 +1307,7 @@ class SHyRepro(BaseModel):
                 prediction_probs.clamp(min=probability_eps, max=1.0 - probability_eps)
             )
 
-        result = {"logit": logits, "y_prob": self.prepare_y_prob(logits)}
+        result = {"logit": logits, "y_prob": self.label_processor.activation(logits)}
         # Expose intermediate phenotype structures and temporal vectors on request.
         if kwargs.get("return_phenotypes", False):
             result["phenotype_hypergraphs"] = phenotype_hypergraphs

@@ -51,7 +51,9 @@ def make_augmentation_model(num_nodes: int = 7) -> SHyRepro:
     return model
 
 
-def make_phenotype_extraction_model(num_nodes: int = 7, num_phenotypes: int = 3) -> SHyRepro:
+def make_phenotype_extraction_model(
+    num_nodes: int = 7, num_phenotypes: int = 3
+) -> SHyRepro:
     """Create small independent mask MLPs for a synthetic extraction check."""
     model = make_hypergraph_builder(num_nodes)
     model.num_phenotypes = num_phenotypes
@@ -67,7 +69,9 @@ def make_phenotype_extraction_model(num_nodes: int = 7, num_phenotypes: int = 3)
     return model
 
 
-def make_temporal_embedding_model(embedding_dim: int = 2, hidden_dim: int = 3) -> SHyRepro:
+def make_temporal_embedding_model(
+    embedding_dim: int = 2, hidden_dim: int = 3
+) -> SHyRepro:
     """Create the GRU and temporal-attention modules without a real dataset."""
     model = make_hypergraph_builder(num_nodes=4)
     model.num_phenotypes = 2
