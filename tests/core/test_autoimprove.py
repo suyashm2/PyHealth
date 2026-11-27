@@ -2,13 +2,18 @@
 
 import importlib.util
 import json
+import math
 import os
 import random
+import re
 import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest import mock
+
+import numpy as np
+import torch
 
 from pyhealth.autoimprove import (
     AutoImprover,
@@ -20,23 +25,32 @@ from pyhealth.autoimprove import (
     RandomProposer,
     SearchSpace,
     Trial,
+    build_report,
     check_models,
+    load_run,
     paired_gain,
+    select_simplest,
     select_trial,
+    signal_check,
     train_pipeline,
+    unverified_numbers,
     with_xgboost,
 )
-from pyhealth.autoimprove.evaluate import patient_folds
+from pyhealth.autoimprove import space as space_module
+from pyhealth.autoimprove.evaluate import chance_fold_scores, patient_folds
+from pyhealth.autoimprove.explain import _effect_bins, attributions, summarize
 from pyhealth.autoimprove.proposers import ProposalContext, parse_json
+from pyhealth.autoimprove.report import flags_for, has_intervals
 from pyhealth.datasets import create_sample_dataset
+from pyhealth.models import LogisticRegression
 from pyhealth.processors import BinaryLabelProcessor
+from pyhealth.tasks import FeatureInfo, TaskCard
 
 SPACE = SearchSpace(
     train_params={
         "epochs": Param("int", 1, 2, default=1),
         "lr": Param("float", 1e-4, 1e-1, log=True, default=1e-2),
         "batch_size": Param("choice", choices=(16, 32), default=16),
-        "pos_weight": Param("choice", choices=("none", "balanced"), default="none"),
     }
 )
 SPACE.models = {k: SPACE.models[k] for k in ("LogisticRegression", "MLP", "RNN")}
@@ -240,7 +254,7 @@ class TestAutoImprover(unittest.TestCase):
 
     def test_failed_trial_is_recorded_as_feedback(self):
         llm = ScriptedLLM([_reply({"model": "RNN", "train_params": {
-            "pos_weight": "balanced"}, "model_params": {"embedding_dim": 16}})])
+            "epochs": 1}, "model_params": {"embedding_dim": 16}})])
         improver = AutoImprover(
             self.train, self.val, LLMProposer(llm), space=SPACE,
             metric="no_such_metric", n_agents=1, n_cycles=1,
@@ -282,9 +296,40 @@ class TestAutoImprover(unittest.TestCase):
         self.assertIn("cross-validation folds", llm.prompts[0])
         self.assertIn("(sd ", llm.prompts[0])
         self.assertIn("Current selection: #0", llm.prompts[0])
-        self.assertIn("standard errors", llm.prompts[0])
-        # the selection follows the paired rule, not the best mean
-        self.assertIs(result.best, select_trial(result.trials, True, 1.0))
+        self.assertIn("standard error", llm.prompts[0])
+        # the selection follows the one-SE rule over the paired candidates
+        self.assertIs(result.best,
+                      select_simplest(result.trials, True, 1.0, SPACE.rung)[0])
+
+    def test_few_events_per_fold_warn_and_flag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            improver = AutoImprover(
+                self.train, self.val, RandomProposer(seed=0),
+                baseline=PipelineConfig("LogisticRegression", {"embedding_dim": 16}),
+                space=SPACE, n_agents=1, n_cycles=1, cv_folds=3, run_dir=tmp,
+                min_events_per_fold=1000,
+            )
+            with self.assertLogs("pyhealth.autoimprove.improver", "WARNING") as logs:
+                improver.run()
+            self.assertTrue(any("positive samples" in m for m in logs.output))
+            events = improver._fold_events()
+            labels = [float(self.train[i]["label"]) for i in range(len(self.train))]
+            self.assertEqual(len(events), 3)
+            self.assertEqual(sum(events), int(sum(labels)))
+            flag = next(f for f in improver.flags() if f["id"] == "few_events")
+            self.assertEqual(flag["kind"], "data")
+            self.assertIn(", ".join(map(str, events)), flag["detail"])
+            self.assertIn("few_events", improver.report().to_markdown())
+            # the saved run keeps the counts, so load_run raises the flag too
+            with open(os.path.join(tmp, "run.json")) as f:
+                self.assertEqual(json.load(f)["fold_events"], events)
+            self.assertIn("few_events", load_run(tmp, space=SPACE).to_markdown())
+        improver.min_events_per_fold = 0
+        self.assertNotIn("few_events", [f["id"] for f in improver.flags()])
+        # without cross-validation there are no folds to count
+        plain = AutoImprover(self.train, self.val, RandomProposer(seed=0),
+                             space=SPACE, n_agents=1, n_cycles=1)
+        self.assertIsNone(plain._fold_events())
 
     def test_clipped_repeat_names_the_clipping(self):
         llm = ScriptedLLM([
@@ -380,7 +425,7 @@ class TestAutoImprover(unittest.TestCase):
             result = improver.run()
         # the best mean, not the trial with the steadiest gain over the first one
         self.assertEqual(result.best.config.model_params["hidden_dim"], 32)
-        self.assertIn("no baseline to compare with", llm.prompts[1])
+        self.assertIn("no starting pipeline to compare with", llm.prompts[1])
 
     def test_resuming_with_changed_settings_is_refused(self):
         baseline = PipelineConfig("LogisticRegression", {"embedding_dim": 16})
@@ -519,14 +564,6 @@ class TestAutoImprover(unittest.TestCase):
             AutoImprover(self.train, self.val, RandomProposer(), space=space,
                          baseline=PipelineConfig("XGBoost")).run()
 
-    def test_balanced_pos_weight_uses_the_training_labels(self):
-        config, _ = SPACE.validate(PipelineConfig(
-            "LogisticRegression", {"embedding_dim": 16}, {"pos_weight": "balanced"}))
-        model = train_pipeline(config, SPACE, self.train, self.val, "pr_auc")
-        positives = sum(s["label"] for s in _samples(80, 0))
-        self.assertAlmostEqual(float(model.pos_weight), (80 - positives) / positives,
-                               places=5)
-
     def test_random_search_budget_and_test_comparison(self):
         improver = AutoImprover(
             self.train, self.val, RandomProposer(seed=1),
@@ -546,17 +583,147 @@ class TestAutoImprover(unittest.TestCase):
         self.assertNotIn("predictions", test)
 
 
+def _random_ap(labels, n=20000, seed=0):
+    """Mean average precision of random rankings, by simulation."""
+    rng = np.random.default_rng(seed)
+    y = np.asarray(labels)
+    ranks = np.arange(1, len(y) + 1)
+    total = 0.0
+    for _ in range(n):
+        p = rng.permutation(y)
+        total += (np.cumsum(p) / ranks)[p == 1].mean()
+    return total / n
+
+
+class TestSignalCheck(unittest.TestCase):
+    """A baseline or selection that does not beat chance is flagged."""
+
+    def test_chance_fold_scores(self):
+        folds = [np.array([0, 1]), np.array([2, 3, 4, 5])]
+        labels = [1, 0, 1, 1, 0, 0]
+        chance = chance_fold_scores(labels, folds, "pr_auc")
+        # one positive of two: a random ranking puts it first half the time
+        self.assertAlmostEqual(chance[0], 0.75)
+        # matches the mean average precision of random rankings
+        self.assertAlmostEqual(chance[1], _random_ap([1, 1, 0, 0]), places=2)
+        self.assertEqual(chance_fold_scores([0, 0], [np.array([0, 1])], "pr_auc"),
+                         [0.0])
+        self.assertEqual(chance_fold_scores(labels, folds, "roc_auc"), [0.5, 0.5])
+        self.assertIsNone(chance_fold_scores(labels, folds, "accuracy"))
+
+    def test_signal_check(self):
+        chance = [0.08, 0.08, 0.08]
+        # the benchmark's null runs: a baseline at chance, a selection a bit above
+        weak = signal_check(chance, [0.11, 0.12, 0.10], [0.07, 0.09, 0.08], "pr_auc")
+        self.assertTrue(weak["no_signal"])
+        self.assertIn("baseline", weak["detail"])
+        self.assertAlmostEqual(weak["baseline"]["gain"], 0.0)
+        # a selection at chance, without a baseline
+        flat = signal_check(chance, [0.07, 0.09, 0.08], metric="pr_auc")
+        self.assertTrue(flat["no_signal"])
+        self.assertIsNone(flat["baseline"])
+        self.assertIn("selected model", flat["detail"])
+        strong = signal_check(chance, [0.40, 0.45, 0.42], [0.30, 0.33, 0.31])
+        self.assertFalse(strong["no_signal"])
+        self.assertEqual(strong["detail"], "")
+        self.assertIsNone(signal_check(chance, [0.4, 0.5]))  # folds do not line up
+
+    def test_flag_and_report(self):
+        weak = signal_check([0.5] * 3, [0.52, 0.5, 0.51], [0.47, 0.48, 0.46],
+                            "roc_auc")
+        self.assertEqual(flags_for(None, None, None, signal=weak)[0]["id"],
+                         "no_signal")
+        self.assertNotIn("no_signal", [f["id"] for f in flags_for(
+            None, None, None, signal={**weak, "no_signal": False})])
+        base = Trial(0, -1, "baseline", "baseline", PipelineConfig("MLP"),
+                     metric_name="roc_auc", score=0.47, fold_scores=[0.47, 0.48, 0.46])
+        report = build_report([base], metric="roc_auc", signal=weak)
+        self.assertIn("No signal?", report.to_markdown())
+        self.assertEqual(report.data["signal"], weak)
+
+    def _run(self, label, run_dir, **kwargs):
+        train, val, _ = _datasets(label=label)
+        improver = AutoImprover(
+            train, val, RandomProposer(0),
+            baseline=PipelineConfig("LogisticRegression", {"embedding_dim": 16}),
+            space=SPACE, n_agents=1, n_cycles=1, cv_folds=3, run_dir=run_dir,
+            check=False, **kwargs,
+        )
+        improver.run()
+        return improver
+
+    def test_null_labels_are_flagged(self):
+        rng = random.Random(7)
+        with tempfile.TemporaryDirectory() as tmp:
+            improver = self._run(lambda codes: int(rng.random() < 0.3), tmp)
+            with open(os.path.join(tmp, "signal.json")) as f:
+                saved = json.load(f)
+            self.assertTrue(saved["no_signal"])
+            self.assertEqual(len(saved["chance"]), 3)
+            self.assertIn("no_signal", [f["id"] for f in improver.flags()])
+            self.assertIn("No signal?", improver.report().to_markdown())
+            self.assertIn("No signal?", load_run(tmp).to_markdown())
+
+    def test_confirmed_runs_compare_on_the_confirmation_folds(self):
+        # After confirm, the selection, the baseline and chance are all
+        # compared on the confirmation folds.
+        calls = []
+
+        def spy(chance, selected, baseline, metric="roc_auc"):
+            calls.append((chance, selected, baseline))
+            return signal_check(chance, selected, baseline, metric)
+
+        with (tempfile.TemporaryDirectory() as tmp,
+              mock.patch("pyhealth.autoimprove.improver.signal_check", spy)):
+            improver = self._run(None, tmp, confirm=True)
+        self.assertTrue(improver.confirmed)
+        chance, selected, baseline = calls[-1]
+        best = improver.result().best
+        base = next(t for t in improver.trials if t.agent == "baseline")
+        folds = patient_folds(improver.train_dataset, 3, improver.seed + 1)
+        expected = chance_fold_scores(improver._labels(), folds, improver.metric)
+        np.testing.assert_allclose(chance, expected)
+        self.assertEqual(list(selected), list(improver.confirmed[best.trial_id]))
+        self.assertEqual(baseline, improver.confirmed.get(base.trial_id))
+
+    def test_a_stale_signal_file_is_removed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "signal.json"), "w") as f:
+                json.dump({"no_signal": True, "detail": "old run"}, f)
+            with mock.patch("pyhealth.autoimprove.improver.MAX_LABEL_SCAN", 10):
+                improver = self._run(None, tmp)
+            self.assertFalse(os.path.exists(os.path.join(tmp, "signal.json")))
+            self.assertNotIn("no_signal", [f["id"] for f in improver.flags()])
+
+    def test_large_datasets_skip_the_check(self):
+        # Above MAX_LABEL_SCAN the check would read every training sample.
+        with (tempfile.TemporaryDirectory() as tmp,
+              mock.patch("pyhealth.autoimprove.improver.MAX_LABEL_SCAN", 10),
+              self.assertLogs("pyhealth.autoimprove.improver", "INFO") as logs):
+            improver = self._run(None, tmp)
+            self.assertFalse(os.path.exists(os.path.join(tmp, "signal.json")))
+            self.assertNotIn("no_signal", [f["id"] for f in improver.flags()])
+        self.assertTrue(any("Skipped the chance check" in m for m in logs.output))
+
+    def test_real_labels_pass(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            improver = self._run(None, tmp)
+            with open(os.path.join(tmp, "signal.json")) as f:
+                self.assertFalse(json.load(f)["no_signal"])
+            self.assertNotIn("no_signal", [f["id"] for f in improver.flags()])
+
+
 class TestLabelTypes(unittest.TestCase):
-    def test_label_type_sets_the_metric_and_the_space(self):
+    def test_label_type_sets_the_metric(self):
         cases = [
-            ("binary", lambda codes: int("c1" in codes), "pr_auc", True),
-            (BinaryLabelProcessor, lambda codes: int("c1" in codes), "pr_auc", True),
-            ("multiclass", _three_classes, "f1_macro", False),
+            ("binary", lambda codes: int("c1" in codes), "pr_auc"),
+            (BinaryLabelProcessor, lambda codes: int("c1" in codes), "pr_auc"),
+            ("multiclass", _three_classes, "f1_macro"),
             ("multilabel", lambda codes: sorted({"c1", "c2"} & set(codes)) or ["none"],
-             "pr_auc_samples", True),
-            ("regression", lambda codes: float(_three_classes(codes)), "mse", False),
+             "pr_auc_samples"),
+            ("regression", lambda codes: float(_three_classes(codes)), "mse"),
         ]
-        for label_type, label, metric, weighted in cases:
+        for label_type, label, metric in cases:
             with self.subTest(label_type=label_type):
                 samples = _samples(20, 0)
                 for s in samples:
@@ -567,23 +734,21 @@ class TestLabelTypes(unittest.TestCase):
                 improver = AutoImprover(data, data, RandomProposer(), space=SPACE,
                                         check=False)
                 self.assertEqual(improver.metric, metric)
-                self.assertEqual("pos_weight" in improver.space.train_params, weighted)
 
     def test_multiclass_search_and_test_scores(self):
         train, val, test = _datasets("multiclass", _three_classes)
         improver = AutoImprover(
             train, val, RandomProposer(seed=0),
-            baseline=PipelineConfig("LogisticRegression", {"embedding_dim": 16},
-                                    {"pos_weight": "balanced"}),
+            baseline=PipelineConfig("LogisticRegression", {"embedding_dim": 16}),
             space=SPACE, n_agents=2, n_cycles=1,
         )
         result = improver.run()
         self.assertTrue(all(t.error is None for t in result.trials))
-        self.assertFalse(any("pos_weight" in t.config.train_params for t in result.trials))
 
         scores = improver.evaluate_on_test(test, return_predictions=True)
-        self.assertEqual(set(scores), {"best", "baseline", "predictions"})
+        self.assertNotIn("difference", scores)
         self.assertIn("estimate", scores["best"])
+        self.assertIn("estimate", scores["baseline"])
         self.assertEqual(scores["predictions"]["best"].shape, (40, 3))
 
 
@@ -629,6 +794,882 @@ class TestSelection(unittest.TestCase):
         for order in ([base, steady, early, later_noise], [later_noise, early, steady, base]):
             self.assertIs(select_trial(order, True, 1.0), steady)
         self.assertIs(select_trial([base, early, later_noise], True, 1.0), early)
+
+
+class TestOneSERule(unittest.TestCase):
+    @staticmethod
+    def _trial(i, model, score, folds, agent=None, params=None):
+        return Trial(i, 0, agent or f"a{i}", "explore",
+                     PipelineConfig(model, params or {}), metric_name="pr_auc",
+                     score=score, fold_scores=folds)
+
+    def test_simpler_model_within_one_se_wins(self):
+        space = with_xgboost(SearchSpace())
+        base = self._trial(0, "XGBoost", 0.50, [0.48, 0.50, 0.52], "baseline",
+                           {"max_depth": 4})
+        lr = self._trial(1, "LogisticRegression", 0.55, [0.52, 0.57, 0.56])
+        deep = self._trial(2, "XGBoost", 0.56, [0.55, 0.555, 0.575], params={
+            "max_depth": 6})
+        noisy = self._trial(3, "MLP", 0.60, [0.40, 0.80, 0.60])  # not a candidate
+        selected, top = select_simplest([base, lr, deep, noisy], True, 1.0, space.rung)
+        self.assertEqual((selected.trial_id, top.trial_id), (1, 2))
+        # without a ladder the top candidate is selected
+        self.assertEqual(select_simplest([base, lr, deep], True, 1.0)[0].trial_id, 2)
+
+    def test_exact_tie_counts_as_within_one_se(self):
+        # Identical fold scores give gap 0 and SE 0; a tie is "within one SE",
+        # so the simpler of two tied configs is selected (and the top
+        # candidate is always within one SE of itself).
+        space = with_xgboost(SearchSpace())
+        base = self._trial(0, "XGBoost", 0.50, [0.48, 0.50, 0.52], "baseline")
+        deep = self._trial(1, "XGBoost", 0.56, [0.55, 0.555, 0.575],
+                           params={"max_depth": 6})
+        lr = self._trial(2, "LogisticRegression", 0.56, [0.55, 0.555, 0.575])
+        selected, top = select_simplest([base, deep, lr], True, 1.0, space.rung)
+        self.assertEqual((selected.trial_id, top.trial_id), (2, 1))
+        selected, top = select_simplest([base, deep], True, 1.0, space.rung)
+        self.assertIs(selected, deep)
+
+    def test_top_kept_when_simpler_is_clearly_worse(self):
+        space = with_xgboost(SearchSpace())
+        base = self._trial(0, "XGBoost", 0.50, [0.50, 0.50, 0.50], "baseline")
+        lr = self._trial(1, "LogisticRegression", 0.52, [0.519, 0.52, 0.521])
+        deep = self._trial(2, "XGBoost", 0.60, [0.599, 0.60, 0.601])
+        selected, top = select_simplest([base, lr, deep], True, 1.0, space.rung)
+        self.assertIs(selected, deep)
+        self.assertIs(top, deep)
+
+    def test_baseline_stays_without_consistent_gains(self):
+        base = self._trial(0, "MLP", 0.50, [0.48, 0.50, 0.52], "baseline")
+        noisy = self._trial(1, "LogisticRegression", 0.52, [0.40, 0.58, 0.58])
+        selected, top = select_simplest([base, noisy], True, 1.0, SearchSpace().rung)
+        self.assertIs(selected, base)
+        self.assertIs(top, base)
+
+    def test_without_a_baseline_every_trial_is_a_candidate(self):
+        # The first trial must not act as a baseline that others have to beat.
+        space = with_xgboost(SearchSpace())
+        first = self._trial(0, "XGBoost", 0.50, [0.50, 0.50, 0.50])
+        lr = self._trial(1, "LogisticRegression", 0.55, [0.45, 0.65, 0.55])
+        deep = self._trial(2, "XGBoost", 0.56, [0.50, 0.66, 0.52])
+        for order in ([first, lr, deep], [deep, lr, first]):
+            selected, top = select_simplest(order, True, 1.0, space.rung)
+            self.assertEqual((selected.trial_id, top.trial_id), (1, 2))
+        report = build_report([first, lr, deep], metric="pr_auc", promote_se=1.0,
+                              space=space)
+        why = report.to_markdown()
+        self.assertIn("no starting pipeline to compare with", why)
+        self.assertNotIn("starting pipeline;", why)  # no trial is labelled as one
+
+    def test_ladder_and_plain_words(self):
+        space = with_xgboost(SearchSpace())
+        rungs = [space.rung(PipelineConfig("LogisticRegression")),
+                 space.rung(PipelineConfig("XGBoost", {"max_depth": 1})),
+                 space.rung(PipelineConfig("XGBoost", {"max_depth": 3})),
+                 space.rung(PipelineConfig("MLP")),
+                 space.rung(PipelineConfig("RNN"))]
+        self.assertEqual(rungs, [1, 2, 3, 3, 4])
+        words = space.explain(PipelineConfig(
+            "XGBoost", {"max_depth": 1, "scale_pos_weight": None}))
+        self.assertIn("additive", words[1])
+        self.assertIn("observed frequencies", words[2])
+
+
+class TestExplainedRuns(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.train, cls.val, cls.test = _datasets()
+
+    def test_decision_log_records_hypothesis_and_change(self):
+        llm = ScriptedLLM([
+            _reply({"model": "MLP", "model_params": {"hidden_dim": 16,
+                    "embedding_dim": 16}, "rationale": "a small MLP",
+                    "expected": "PR-AUC up", "kind": "technical"}),
+            _reply({"model": "MLP", "model_params": {"hidden_dim": 32,
+                    "embedding_dim": 16}, "based_on": 1,
+                    "rationale": "wider"}),
+        ])
+        with tempfile.TemporaryDirectory() as tmp:
+            improver = AutoImprover(
+                self.train, self.val, LLMProposer(llm),
+                baseline=PipelineConfig("LogisticRegression", {"embedding_dim": 16}),
+                space=SPACE, n_agents=1, n_cycles=2, patience=5, run_dir=tmp,
+            )
+            result = improver.run()
+            first, second = result.trials[1], result.trials[2]
+            self.assertEqual(first.parent, 0)  # nearest earlier trial
+            self.assertEqual(first.change["model"], "LogisticRegression → MLP")
+            self.assertEqual(first.config.hypothesis,
+                             {"expected": "PR-AUC up", "kind": "technical"})
+            self.assertEqual((second.parent, second.change),
+                             (1, {"hidden_dim": "16 → 32"}))
+            # the log round-trips, and older records without the fields load
+            with open(os.path.join(tmp, "trials.jsonl")) as f:
+                saved = [json.loads(line) for line in f]
+            self.assertEqual(Trial.from_dict(saved[2]).change, second.change)
+            old = {k: v for k, v in saved[1].items() if k not in ("parent", "change")}
+            old["unknown_future_field"] = 1
+            self.assertIsNone(Trial.from_dict(old).parent)
+            self.assertTrue(os.path.exists(os.path.join(tmp, "run.json")))
+
+    def test_attribution_reverts_one_setting_at_a_time(self):
+        # depth 4 -> 2 is worth 0.04 and n_estimators 300 -> 600 nothing
+        def fake_cv(config, space, train, val, metric, folds, *args, **kwargs):
+            p = config.model_params
+            mean = 0.50 + (0.04 if p["max_depth"] == 2 else 0.0)
+            return {"metrics": {metric: mean},
+                    "fold_scores": [mean - 0.01, mean, mean + 0.01],
+                    "seconds": 0.0, "n_params": 0}
+
+        target = {"max_depth": 2, "n_estimators": 600}
+        llm = ScriptedLLM([_reply({"model": "XGBoost", "model_params": target})])
+        with tempfile.TemporaryDirectory() as tmp, mock.patch(
+            "pyhealth.autoimprove.improver.run_config_cv", fake_cv
+        ):
+            improver = AutoImprover(
+                self.train, self.val, LLMProposer(llm),
+                baseline=PipelineConfig("XGBoost", {"max_depth": 4}),
+                space=with_xgboost(SPACE), n_agents=1, n_cycles=1, cv_folds=3,
+                run_dir=tmp, check=False,
+            )
+            result = improver.run()
+            self.assertEqual(result.best.trial_id, 1)
+            out = improver.attribute()
+            rows = {r["setting"]: r for r in out["rows"]}
+            self.assertEqual(set(rows), {"max_depth", "n_estimators"})
+            self.assertAlmostEqual(rows["max_depth"]["contribution"], 0.04)
+            self.assertAlmostEqual(rows["n_estimators"]["contribution"], 0.0)
+            self.assertEqual(out["reference"], "the starting pipeline (#0)")
+            self.assertTrue(os.path.exists(os.path.join(tmp, "attribution.json")))
+
+            report = improver.report()
+            text = report.to_markdown()
+            self.assertIn("What each change contributed", text)
+            self.assertIn("max_depth", text)
+            for name in ("report.html", "report.md", "report.json"):
+                self.assertTrue(os.path.exists(os.path.join(tmp, name)))
+            # rebuilt from the run directory alone, the report is the same
+            self.assertEqual(load_run(tmp).to_markdown(), text)
+
+    def test_report_from_a_real_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            improver = AutoImprover(
+                self.train, self.val, RandomProposer(seed=1),
+                baseline=PipelineConfig("LogisticRegression", {"embedding_dim": 16}),
+                space=SPACE, n_agents=2, n_cycles=2, cv_folds=3, run_dir=tmp,
+            )
+            result = improver.run()
+            test = improver.evaluate_on_test(self.test, n_boot=50, return_predictions=True)
+            with open(os.path.join(tmp, "test.json")) as f:
+                saved = json.load(f)
+            self.assertEqual(saved["best"]["trial_id"], result.best.trial_id)
+            self.assertIn("predictions", test)
+            self.assertNotIn("predictions", saved)  # aggregates only on disk
+            self.assertEqual(test["metric"], "pr_auc")
+            report = improver.report()
+            titles = [s.title for s in report.sections]
+            self.assertEqual(titles, [
+                "Summary", "Task and data", "The model and why",
+                "Performance in clinical terms", "Reasoning trace",
+                "Clinician review", "Reporting checklist", "How to read this report",
+            ])
+            html_text = report.to_html()
+            self.assertIn("<table>", html_text)
+            self.assertIn("Why this model", html_text)
+            verdicts = report.data["verdicts"]
+            self.assertEqual(verdicts[result.best.trial_id], "selected")
+            self.assertEqual(len(verdicts), len(result.trials))
+
+    def test_baseline_kept_after_confirmation(self):
+        from pyhealth.autoimprove.report import build_report
+
+        folds = [0.40, 0.41, 0.42, 0.43, 0.44]
+        trials = [Trial(0, -1, "baseline", "baseline", PipelineConfig("MLP"),
+                        score=0.42, fold_scores=folds),
+                  Trial(1, 0, "a0", "explore",
+                        PipelineConfig("MLP", {}, {"weight_decay": 0.01}),
+                        score=0.45, fold_scores=[x + 0.03 for x in folds])]
+        confirmed = {0: folds, 1: [x + d for x, d in
+                                   zip(folds, [0.02, -0.01, 0.02, -0.01, 0.0])]}
+        text = build_report(trials, metric="pr_auc", confirmed=confirmed).to_markdown()
+        self.assertIn("**Selected: #0", text)
+        self.assertNotIn("beat the starting pipeline consistently", text)
+        self.assertIn("1 trial(s) beat the starting pipeline on the search folds", text)
+
+    def test_run_json_rule_is_rewritten_when_the_baseline_fails(self):
+        def fake_cv(config, space, train, val, metric, folds, *args, **kwargs):
+            if config.model_params.get("max_depth") == 4:
+                raise ValueError("baseline broke")
+            return {"metrics": {metric: 0.5}, "fold_scores": [0.49, 0.5, 0.51],
+                    "seconds": 0.0, "n_params": 0}
+
+        llm = ScriptedLLM([_reply({"model": "XGBoost",
+                                   "model_params": {"max_depth": 2}})])
+        with tempfile.TemporaryDirectory() as tmp, mock.patch(
+            "pyhealth.autoimprove.improver.run_config_cv", fake_cv
+        ):
+            improver = AutoImprover(
+                self.train, self.val, LLMProposer(llm),
+                baseline=PipelineConfig("XGBoost", {"max_depth": 4}),
+                space=with_xgboost(SPACE), n_agents=1, n_cycles=1, cv_folds=3,
+                run_dir=tmp, check=False,
+            )
+            improver.run()
+            self.assertIsNotNone(improver.trials[0].error)
+            with open(os.path.join(tmp, "run.json")) as f:
+                rule = json.load(f)["rule"]
+            self.assertEqual(rule, improver.selection_rule())
+            self.assertIn("no starting pipeline", rule)
+
+
+    def test_runs_started_with_another_space_are_resumed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            def improver(n_cycles):
+                return AutoImprover(
+                    self.train, self.val, RandomProposer(seed=0),
+                    baseline=PipelineConfig("LogisticRegression",
+                                            {"embedding_dim": 16}),
+                    space=SPACE, n_agents=1, n_cycles=n_cycles, run_dir=tmp,
+                    check=False,
+                )
+
+            improver(1).run()
+            path = os.path.join(tmp, "meta.json")
+            with open(path) as f:
+                meta = json.load(f)
+            # the ladder's wording is not part of the fingerprint
+            self.assertNotIn("rung", meta["space"])
+            self.assertEqual(meta["space"].splitlines()[0],
+                             "Models and their arguments:")
+            # a run written with an older space (e.g. XGBoost's depth from 2)
+            meta["space"] = meta["space"].replace("[16, 256]", "[8, 256]")
+            with open(path, "w") as f:
+                json.dump(meta, f)
+            with self.assertLogs("pyhealth.autoimprove.improver", "WARNING") as logs:
+                result = improver(2).run()
+            self.assertIn("different search space", "\n".join(logs.output))
+            self.assertEqual(len(result.trials), 3)
+            with open(path) as f:
+                self.assertEqual(json.load(f)["space"],
+                                 SPACE.describe(rungs=False))
+
+    def test_attribution_against_the_default_settings(self):
+        # the trial's model differs from the baseline's: settings are reverted
+        # to the model's defaults
+        def fake_cv(config, space, train, val, metric, folds, *args, **kwargs):
+            mean = 0.50 + (0.04 if config.model_params.get("max_depth") == 2 else 0)
+            return {"metrics": {metric: mean},
+                    "fold_scores": [mean - 0.01, mean, mean + 0.01],
+                    "seconds": 0.0, "n_params": 0}
+
+        llm = ScriptedLLM([_reply({"model": "XGBoost",
+                                   "model_params": {"max_depth": 2}})])
+        with mock.patch("pyhealth.autoimprove.improver.run_config_cv", fake_cv):
+            improver = AutoImprover(
+                self.train, self.val, LLMProposer(llm),
+                baseline=PipelineConfig("LogisticRegression", {"embedding_dim": 16}),
+                space=with_xgboost(SPACE), n_agents=1, n_cycles=1, cv_folds=3,
+                check=False,
+            )
+            self.assertEqual(improver.run().best.trial_id, 1)
+            out = improver.attribute()
+        self.assertEqual(out["reference"], "the default settings of XGBoost")
+        self.assertEqual([r["setting"] for r in out["rows"]], ["max_depth"])
+        self.assertEqual((out["rows"][0]["from"], out["rows"][0]["to"]), (4, 2))
+        self.assertAlmostEqual(out["rows"][0]["contribution"], 0.04)
+
+    def test_number_checker(self):
+        trials = [Trial(0, -1, "baseline", "baseline", PipelineConfig("MLP"),
+                        score=0.2164),
+                  Trial(1, 0, "a0", "explore",
+                        PipelineConfig("MLP", {}, {"weight_decay": 0.01}),
+                        score=0.2950)]
+        text = ("#1 scored 0.295 vs 0.216 (+0.079) with weight decay 0.01; "
+                "batch 32 dropped to 0.256")
+        self.assertEqual(unverified_numbers(text, trials), ["0.256"])
+
+
+def _tabular(n, seed, offset=0):
+    """Three numeric columns: one raises risk, one lowers it, one is noise."""
+    rng = random.Random(seed)
+    out = []
+    for i in range(n):
+        x = [rng.gauss(0, 1) for _ in range(3)]
+        risk = 1 / (1 + math.exp(-(2.0 * x[0] - 1.5 * x[1])))
+        out.append({"patient_id": f"q{offset + i}", "tab": x,
+                    "label": int(rng.random() < risk)})
+    return out
+
+
+def _tabular_datasets():
+    schema = ({"tab": "tensor"}, {"label": "binary"})
+    train = create_sample_dataset(_tabular(300, 0), *schema)
+    kwargs = {"input_processors": train.input_processors,
+              "output_processors": train.output_processors}
+    val = create_sample_dataset(_tabular(80, 1, 1000), *schema, **kwargs)
+    test = create_sample_dataset(_tabular(200, 2, 2000), *schema, **kwargs)
+    return train, val, test
+
+
+# The card expects "protect" to raise risk; the data say it lowers it.
+CARD = TaskCard(
+    population=("synthetic patients", "a test of the explanation"),
+    outcome="a planted binary label",
+    features={
+        "risk_up": FeatureInfo("planted risk factor", "labs", "+"),
+        "protect": FeatureInfo("planted protective factor", "labs", "+"),
+        "noise": FeatureInfo("unrelated value", "other", ""),
+    },
+    columns={"tab": ["risk_up", "protect", "noise"]},
+    notes="No missing values.",
+)
+
+
+class TestClinicalReport(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.train, cls.val, cls.test = _tabular_datasets()
+
+    def test_explain_flags_review_and_privacy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            improver = AutoImprover(
+                self.train, self.val, RandomProposer(seed=0),
+                baseline=PipelineConfig("LogisticRegression", {"embedding_dim": 16},
+                                        {"epochs": 2}),
+                space=SPACE, n_agents=1, n_cycles=1, cv_folds=3, run_dir=tmp,
+                task_card=CARD,
+            )
+            improver.run()
+            explanation = improver.explain(top_k=3)
+            by_name = {f["name"]: f for f in explanation["features"]}
+            self.assertEqual(by_name["risk_up"]["learned"], "+")
+            self.assertEqual(by_name["risk_up"]["check"], "as expected")
+            self.assertEqual(by_name["protect"]["learned"], "-")
+            self.assertEqual(by_name["protect"]["check"], "opposite")
+            self.assertEqual(explanation["groups"][0]["group"], "labs")
+            self.assertEqual(explanation["stability"]["models"], 3)
+
+            ids = [f["id"] for f in improver.flags()]
+            self.assertIn("direction:protect", ids)
+            self.assertNotIn("direction:risk_up", ids)
+            improver.approve("direction:protect", "Dr. Test", "planted in the data")
+            flag = next(f for f in improver.flags() if f["id"] == "direction:protect")
+            self.assertEqual(flag["review"]["decision"], "approved")
+            with self.assertRaises(ValueError):
+                improver.approve("no_such_flag", "Dr. Test")
+
+            halves = ["early" if i < 100 else "late" for i in range(len(self.test))]
+            test = improver.evaluate_on_test(self.test, n_boot=50,
+                                             subgroups={"half": halves})
+            clinical = test["best"]["clinical"]
+            self.assertIn("calibration_slope", clinical["calibration"])
+            self.assertIn("half", clinical["subgroups"])
+
+            report = improver.report()
+            titles = [s.title for s in report.sections]
+            self.assertIn("How it decides", titles)
+            self.assertIn("Performance in clinical terms", titles)
+            text = report.to_markdown()
+            self.assertIn("approved by Dr. Test", text)
+            self.assertIn("planted protective factor", text)
+            self.assertIn("TRIPOD+AI", text)
+            self.assertEqual(load_run(tmp, space=SPACE).to_markdown(), text)
+
+            # Privacy: no patient ids, and every published cell has 11+ patients.
+            blob = report.to_json() + report.to_html()
+            self.assertIsNone(re.search(r"\bq\d+\b", blob))
+            for f in report.data["explanation"]["features"]:
+                self.assertTrue(all(b["n"] >= 11 for b in f["bins"]))
+            for sub in clinical["subgroups"].values():
+                for row in sub["groups"].values():
+                    self.assertTrue(row["n"] is None or row["n"] >= 11)
+            self.assertTrue(all(b["n"] >= 11 for b in clinical["calibration_bins"]))
+
+    def test_calibration_and_subgroup_gap_flags(self):
+        from pyhealth.autoimprove.report import flags_for
+
+        def test(slope, oe, gap):
+            return {"best": {"clinical": {
+                "calibration": {"calibration_slope": slope, "oe_ratio": oe},
+                "subgroups": {"sex": {"max_gap": {"roc_auc": gap}}},
+            }}}
+
+        def ids(t):
+            return [f["id"] for f in flags_for(CARD, None, t)]
+
+        self.assertEqual(ids(test(1.0, 1.0, 0.05)), [])
+        self.assertEqual(ids(test(0.5, 1.0, 0.05)), ["calibration"])  # poor slope
+        self.assertEqual(ids(test(1.0, 2.0, 0.05)), ["calibration"])  # poor O/E
+        self.assertEqual(ids(test(1.0, 1.0, 0.1)), ["subgroup_gap:sex"])
+        both = flags_for(CARD, None, test(0.5, float("nan"), 0.2))
+        self.assertEqual([f["id"] for f in both], ["calibration", "subgroup_gap:sex"])
+        self.assertIn("observed / expected n/a", both[0]["detail"])
+        # NaN alone raises no flag
+        self.assertEqual(ids(test(float("nan"), None, float("nan"))), [])
+
+    def test_stability_refits_use_fold_parts(self):
+        # Each stability fold model goes through fold_parts, so engineered
+        # columns would be refitted on the fold, as in cross-validation.
+        from pyhealth.autoimprove import evaluate
+
+        improver = AutoImprover(
+            self.train, self.val, RandomProposer(seed=0),
+            baseline=PipelineConfig("LogisticRegression", {"embedding_dim": 16},
+                                    {"epochs": 2}),
+            space=SPACE, n_agents=1, n_cycles=1, cv_folds=3, task_card=CARD,
+        )
+        improver.run()
+        with mock.patch("pyhealth.autoimprove.improver.fold_parts",
+                        side_effect=evaluate.fold_parts) as spy:
+            out = improver.explain(top_k=3)
+        self.assertEqual(spy.call_count, 3)
+        self.assertEqual(out["stability"]["models"], 3)
+
+    def test_selected_baseline_is_reported_once(self):
+        # With only the baseline trial, it is the selected config: the test
+        # output has `best` and no `baseline` or `difference`, and the
+        # report still renders the clinical section.
+        improver = AutoImprover(
+            self.train, self.val, RandomProposer(seed=0),
+            baseline=PipelineConfig("LogisticRegression", {"embedding_dim": 16},
+                                    {"epochs": 2}),
+            space=SPACE, n_agents=1, n_cycles=1, max_trials=1, task_card=CARD,
+        )
+        result = improver.run()
+        self.assertIs(result.best, result.baseline)
+        test = improver.evaluate_on_test(self.test, n_boot=20)
+        self.assertIn("best", test)
+        self.assertNotIn("baseline", test)
+        self.assertNotIn("difference", test)
+        self.assertIn("clinical", test["best"])
+        report = improver.report()
+        self.assertIn("Performance in clinical terms",
+                      [s.title for s in report.sections])
+        self.assertNotIn("selected − starting pipeline", report.to_markdown())
+
+    def test_flags_and_report_without_run_dir(self):
+        # Results are kept in memory, so flags and the report still see them.
+        improver = AutoImprover(
+            self.train, self.val, RandomProposer(seed=0),
+            baseline=PipelineConfig("LogisticRegression", {"embedding_dim": 16},
+                                    {"epochs": 2}),
+            space=SPACE, n_agents=1, n_cycles=1, task_card=CARD,
+        )
+        improver.run()
+        improver.explain(top_k=3)
+        self.assertIn("direction:protect", [f["id"] for f in improver.flags()])
+        improver.evaluate_on_test(self.test, n_boot=20)
+        titles = [s.title for s in improver.report().sections]
+        self.assertIn("How it decides", titles)
+        self.assertIn("Performance in clinical terms", titles)
+
+    def test_effect_bins_give_a_shared_value_its_own_bin(self):
+        # 0 = "unmeasured" for 60 of 100 patients: it gets its own bin, and
+        # the measured values are cut around it.
+        rng = np.random.default_rng(0)
+        value = np.concatenate([np.zeros(60), rng.uniform(1, 10, 40)])
+        contrib = np.where(value == 0, -1.0, value / 10)
+        bins = _effect_bins(value, contrib, np.arange(100), 11, 5)
+        self.assertEqual(bins[0]["label"], "= 0")
+        self.assertEqual(bins[0]["n"], 60)
+        self.assertAlmostEqual(bins[0]["effect"], -1.0)
+        self.assertGreater(len(bins), 1)
+        self.assertTrue(all(b["n"] >= 11 for b in bins))
+        self.assertEqual(sum(b["n"] for b in bins), 100)
+
+    def test_effect_bins_with_one_bin_of_several_values(self):
+        # A rare code: 12 samples at 0, 3 at 1. The small bins
+        # merge into one holding every value, which has no cut point.
+        value = np.array([0.0] * 12 + [1.0] * 3)
+        bins = _effect_bins(value, value * 0.5, np.arange(15), 11, 5)
+        self.assertEqual([b["label"] for b in bins], ["all values"])
+        self.assertEqual(bins[0]["n"], 15)
+
+    def test_logistic_attributions_are_exact(self):
+        model = LogisticRegression(self.train, embedding_dim=8)
+        out = attributions(model, self.train, max_samples=100)
+        values = out["fields"]["tab"]["values"]
+        contribs = out["fields"]["tab"]["contributions"]
+        layer = model.embedding_model.embedding_layers["tab"]
+        weights = (model.fc.weight @ layer.weight).detach().numpy().ravel()
+        # integrated gradients start from the mean of the explained samples
+        expected = (values - values.mean(axis=0)) * weights
+        np.testing.assert_allclose(contribs, expected, atol=1e-4)
+
+    def test_time_series_attributions_per_feature(self):
+        # A (time, features) field: integrated gradients of a linear model are
+        # exact, summed over time per feature; values are averaged over time.
+        rng = np.random.default_rng(0)
+        samples = [{"patient_id": f"p{i}", "ts": rng.normal(size=(4, 3)).tolist(),
+                    "label": i % 2} for i in range(40)]
+        data = create_sample_dataset(samples, {"ts": "tensor"}, {"label": "binary"})
+        weight = torch.tensor([0.5, -1.0, 0.0])
+
+        class Linear(torch.nn.Module):
+            feature_keys = ["ts"]
+
+            def __init__(self):
+                super().__init__()
+                self.bias = torch.nn.Parameter(torch.zeros(1))
+
+            def forward(self, ts, **kwargs):
+                return {"logit": (ts * weight).sum(dim=(1, 2)).unsqueeze(-1) + self.bias}
+
+        out = attributions(Linear(), data, steps=5)
+        x = np.stack([np.asarray(s["ts"].numpy(), dtype=float)
+                      for s in (data[i] for i in range(len(data)))])
+        values = out["fields"]["ts"]["values"]
+        contribs = out["fields"]["ts"]["contributions"]
+        np.testing.assert_allclose(values, x.mean(axis=1), atol=1e-5)
+        expected = ((x - x.mean(axis=0)) * weight.numpy()).sum(axis=1)
+        np.testing.assert_allclose(contribs, expected, atol=1e-4)
+        self.assertEqual(contribs.shape, (40, 3))
+
+    def test_tree_attributions_use_the_model_columns(self):
+        # A nested multi-hot field is (n, visits, vocab) as input but one
+        # column per code (visit counts, reserved codes dropped) in the tree
+        # model; values and TreeSHAP contributions must line up by column.
+        samples = [{"patient_id": f"p{i}", "visits": [["a", "b"], ["b"]][: 1 + i % 2],
+                    "label": i % 2} for i in range(30)]
+        data = create_sample_dataset(samples, {"visits": "nested_multihot"},
+                                     {"label": "binary"})
+
+        class Trees(torch.nn.Module):
+            feature_keys = ["visits"]
+            estimators_ = [None]
+            feature_layout = [{"key": "visits", "start": 0, "stop": 2}]
+
+            def build_feature_matrix(self, **batch):
+                return batch["visits"].sum(dim=1)[:, 2:].numpy()
+
+            def explain(self, **batch):
+                counts = torch.as_tensor(self.build_feature_matrix(**batch))
+                return {"attributions": {"visits": counts * torch.tensor([0.5, -1.0])}}
+
+        out = attributions(Trees(), data)
+        self.assertTrue(out["method"].startswith("TreeSHAP"))
+        values = out["fields"]["visits"]["values"]
+        contribs = out["fields"]["visits"]["contributions"]
+        self.assertEqual(values.shape, (30, 2))
+        np.testing.assert_allclose(contribs, values * [0.5, -1.0])
+        self.assertEqual(sorted(np.unique(values[:, 1])), [1.0, 2.0])  # visits with "b"
+
+    def _code_model(self, data, key, flatten=False):
+        """A linear model on summed code embeddings: each code occurrence
+        adds exactly ``embedding[code] @ weight`` to the logit."""
+        vocab = len(data.input_processors[key].code_vocab)
+
+        class Codes(torch.nn.Module):
+            feature_keys = (key,)
+
+            def __init__(self):
+                super().__init__()
+                torch.manual_seed(0)
+                self.embedding_model = torch.nn.Module()
+                self.embedding_model.embedding_layers = torch.nn.ModuleDict(
+                    {key: torch.nn.Embedding(vocab, 4, padding_idx=0)})
+                self.weight = torch.nn.Parameter(torch.randn(4))
+
+            def forward(self, **batch):
+                x = batch[key]
+                if flatten:  # like LogisticRegression on nested codes
+                    x = x.reshape(len(x), -1)
+                e = self.embedding_model.embedding_layers[key](x)
+                pooled = e.reshape(len(x), -1, e.shape[-1]).sum(dim=1)
+                return {"logit": (pooled @ self.weight).unsqueeze(-1)}
+
+        return Codes()
+
+    def _check_code_columns(self, data, key, model, out):
+        processor = data.input_processors[key]
+        layer = model.embedding_model.embedding_layers[key]
+        per_code = (layer.weight @ model.weight).detach().numpy()
+        entry = out["fields"][key]
+        self.assertEqual(out["skipped"], {})
+        expected = np.asarray([per_code[processor.code_vocab[name]]
+                               for name in entry["names"]])
+        np.testing.assert_allclose(entry["contributions"],
+                                   entry["values"] * expected, atol=1e-4)
+        return entry
+
+    def test_code_attributions_per_code(self):
+        # A sequence of codes: one column per code seen (padding dropped),
+        # valued by its count in the sample, with the summed contribution of
+        # its occurrences (exact for a model linear in the embeddings).
+        samples = [{"patient_id": f"p{i}",
+                    "codes": ["bad", "x"] * (1 + i % 2) if i % 3 == 0 else ["ok"],
+                    "label": int(i % 3 == 0)} for i in range(36)]
+        data = create_sample_dataset(samples, {"codes": "sequence"},
+                                     {"label": "binary"})
+        model = self._code_model(data, "codes")
+        out = attributions(model, data, steps=4, batch_size=8)  # several batches
+        entry = self._check_code_columns(data, "codes", model, out)
+        self.assertEqual(sorted(entry["names"]), ["bad", "ok", "x"])
+        self.assertEqual(out["sample_index"], list(range(36)))
+        sub = attributions(model, data, steps=2, batch_size=8, max_samples=10)
+        self.assertEqual(len(sub["sample_index"]), 10)
+        self.assertEqual(sub["fields"]["codes"]["values"].shape[0], 10)
+        values = dict(zip(entry["names"], entry["values"].T))
+        self.assertEqual(sorted(set(values["bad"])), [0.0, 1.0, 2.0])
+        self.assertEqual(sorted(set(values["ok"])), [0.0, 1.0])
+        summary = summarize(out, top_k=3)
+        self.assertEqual({f["group"] for f in summary["features"]}, {"codes"})
+        self.assertEqual([g["group"] for g in summary["groups"]], ["codes"])
+        self.assertEqual({f["name"] for f in summary["features"]}, {"bad", "ok", "x"})
+
+    def test_nested_code_attributions(self):
+        # Nested codes (visits of codes), embedded as is or flattened first.
+        samples = [{"patient_id": f"p{i}",
+                    "visits": [["a", "b"], ["b"]] if i % 2 else [["c"]],
+                    "label": i % 2} for i in range(30)]
+        data = create_sample_dataset(samples, {"visits": "nested_sequence"},
+                                     {"label": "binary"})
+        for flatten in (False, True):
+            with self.subTest(flatten=flatten):
+                model = self._code_model(data, "visits", flatten=flatten)
+                out = attributions(model, data, steps=4)
+                entry = self._check_code_columns(data, "visits", model, out)
+                values = dict(zip(entry["names"], entry["values"].T))
+                self.assertEqual(sorted(set(values["b"])), [0.0, 2.0])
+
+    def test_code_attributions_with_frozen_embeddings(self):
+        # Frozen embeddings (e.g. EmbeddingModel(freeze_pretrained=True))
+        # still get per-code attributions.
+        samples = [{"patient_id": f"p{i}", "codes": ["a", "b"][: 1 + i % 2],
+                    "label": i % 2} for i in range(20)]
+        data = create_sample_dataset(samples, {"codes": "sequence"},
+                                     {"label": "binary"})
+        model = self._code_model(data, "codes")
+        model.embedding_model.embedding_layers["codes"].weight.requires_grad_(False)
+        out = attributions(model, data, steps=4, min_cell=1)
+        entry = self._check_code_columns(data, "codes", model, out)
+        self.assertEqual(sorted(entry["names"]), ["a", "b"])
+
+    def test_rare_codes_are_not_named(self):
+        # "rare" is in 5 patients (< 11): it joins "other codes" with its
+        # counts and contributions, and summarize() never names it.
+        samples = [{"patient_id": f"p{i}",
+                    "codes": ["common", "rare"] if i < 5 else ["common"],
+                    "label": int(i < 10)} for i in range(30)]
+        data = create_sample_dataset(samples, {"codes": "sequence"},
+                                     {"label": "binary"})
+        model = self._code_model(data, "codes")
+        out = attributions(model, data, steps=4)
+        entry = out["fields"]["codes"]
+        self.assertEqual(entry["names"], ["common", "other codes"])
+        self.assertEqual(entry["values"][:, 1].sum(), 5)
+        layer = model.embedding_model.embedding_layers["codes"]
+        rare = data.input_processors["codes"].code_vocab["rare"]
+        per_code = float((layer.weight[rare] @ model.weight).detach())
+        np.testing.assert_allclose(entry["contributions"][:5, 1], per_code,
+                                   atol=1e-4)
+        names = {f["name"] for f in summarize(out, top_k=5)["features"]}
+        self.assertNotIn("rare", names)
+
+    def test_an_unused_numeric_input_fails(self):
+        samples = [{"patient_id": f"p{i}", "x": [float(i), 1.0],
+                    "label": i % 2} for i in range(12)]
+        data = create_sample_dataset(samples, {"x": "tensor"}, {"label": "binary"})
+
+        class Unused(torch.nn.Module):
+            feature_keys = ("x",)
+
+            def __init__(self):
+                super().__init__()
+                self.bias = torch.nn.Parameter(torch.zeros(1))
+
+            def forward(self, **batch):
+                return {"logit": self.bias.expand(len(batch["x"]), 1)}
+
+        with self.assertRaisesRegex(RuntimeError, "does not use the input 'x'"):
+            attributions(Unused(), data, steps=2)
+
+    def test_code_attributions_with_a_pyhealth_model(self):
+        samples = [{"patient_id": f"p{i}", "codes": ["a", "b"][: 1 + i % 2],
+                    "label": i % 2} for i in range(20)]
+        data = create_sample_dataset(samples, {"codes": "sequence"},
+                                     {"label": "binary"})
+        model = LogisticRegression(data, embedding_dim=4)
+        out = attributions(model, data, steps=3, min_cell=1)
+        self.assertEqual(out["skipped"], {})
+        self.assertEqual(sorted(out["fields"]["codes"]["names"]), ["a", "b"])
+        self.assertEqual(out["fields"]["codes"]["values"].shape, (20, 2))
+
+    @unittest.skipUnless(importlib.util.find_spec("xgboost"), "needs xgboost")
+    def test_tree_attributions(self):
+        from pyhealth.models import XGBoostModel
+
+        model = XGBoostModel(self.train, n_estimators=50, max_depth=2).fit(self.train)
+        out = summarize(attributions(model, self.train), CARD, top_k=3)
+        self.assertTrue(out["method"].startswith("TreeSHAP"))
+        by_name = {f["name"]: f for f in out["features"]}
+        self.assertEqual(by_name["risk_up"]["learned"], "+")
+        self.assertEqual(by_name["protect"]["check"], "opposite")
+
+
+_CI = {"estimate": 0.5, "lower": 0.4, "upper": 0.6}
+
+
+class TestReportIntegrity(unittest.TestCase):
+    """The report keeps raw values out and never mislabels whose numbers it shows."""
+
+    SPACE = with_xgboost(SearchSpace())
+
+    @staticmethod
+    def _trial(i, model, score, folds, agent=None, params=None, **kwargs):
+        return Trial(i, 0, agent or f"a{i}", "explore",
+                     PipelineConfig(model, params or {}), metric_name="pr_auc",
+                     score=score, fold_scores=folds, **kwargs)
+
+    def _trials(self):
+        # selected #1 (simplest within one SE), top #2
+        return [
+            self._trial(0, "XGBoost", 0.50, [0.48, 0.50, 0.52], "baseline",
+                        {"max_depth": 4}),
+            self._trial(1, "LogisticRegression", 0.55, [0.52, 0.57, 0.56]),
+            self._trial(2, "XGBoost", 0.56, [0.55, 0.555, 0.575],
+                        params={"max_depth": 6}),
+        ]
+
+    def _report(self, trials=None, **kwargs):
+        return build_report(trials or self._trials(), metric="pr_auc",
+                            promote_se=1.0, space=self.SPACE, **kwargs)
+
+    def test_error_messages_stay_out_of_the_report(self):
+        failed = self._trial(
+            3, "RNN", None, [],
+            error="ValueError: invalid literal 'patient 10023' at evaluate.py:12: "
+                  "x = int(v)",
+            error_brief="ValueError at evaluate.py:12: x = int(v)")
+        # saved before error_brief existed
+        old = self._trial(4, "MLP", None, [], error="KeyError: 'patient 10023'")
+        report = self._report(self._trials() + [failed, old])
+        for text in (report.to_markdown(), report.to_html(), report.to_json()):
+            self.assertNotIn("10023", text)
+        self.assertEqual(report.data["verdicts"][3],
+                         "failed: ValueError at evaluate.py:12: x = int(v)")
+        self.assertEqual(report.data["verdicts"][4], "failed: KeyError")
+        nothing = build_report([old], metric="pr_auc")
+        self.assertNotIn("10023", nothing.to_json())
+
+    def test_no_intervals_promised_without_them(self):
+        # Multiclass and multilabel tasks get the metric's value only.
+        test = {"metric": "f1_macro",
+                "best": {"estimate": 0.153, "trial_id": 1},
+                "baseline": {"estimate": 0.112, "trial_id": 0}}
+        self.assertFalse(has_intervals(test))
+        self.assertTrue(has_intervals({"best": _CI}))
+        text = self._report(test=test).to_markdown()
+        self.assertNotIn("95% CI", text)
+        self.assertIn("bootstrap intervals are computed for binary tasks only", text)
+        self.assertIn("selected − starting pipeline: +0.041 (no interval)", text)
+        self.assertIn("alerts and net benefit need a binary task", text)
+        self.assertIn("intervals and calibration need a binary task", text)
+        self.assertNotIn("run evaluate_on_test", text)
+
+        binary = self._report(test={"metric": "pr_auc",
+                                    "best": {**_CI, "trial_id": 1}}).to_markdown()
+        self.assertIn("patient-level bootstrap 95% CIs", binary)
+        self.assertNotIn("binary tasks only", binary)
+
+    def test_test_results_for_another_trial_are_left_out(self):
+        fresh = {"metric": "pr_auc", "best": {**_CI, "trial_id": 1},
+                 "top": {**_CI, "trial_id": 2},
+                 "top_minus_best": {"estimate": 0.01, "lower": -0.02, "upper": 0.04}}
+        report = self._report(test=fresh)
+        text = report.to_markdown()
+        self.assertIn("On the test patients", text)
+        self.assertIn("on test the difference", text)
+        self.assertEqual(report.data["notes"], [])
+
+        stale = self._report(test={**fresh, "best": {**_CI, "trial_id": 2}})
+        text = stale.to_markdown()
+        self.assertNotIn("On the test patients", text)
+        self.assertIn("test.json) are for trial #2, not the selected trial #1", text)
+        self.assertNotIn("Test comparison", [s.title for s in stale.sections])
+        self.assertIsNone(stale.data["test"])
+
+        old_top = self._report(test={**fresh, "top": {**_CI, "trial_id": 0}})
+        text = old_top.to_markdown()
+        self.assertIn("On the test patients", text)
+        self.assertIn("no longer the highest-scoring candidate", text)
+        self.assertNotIn("on test the difference", text)
+
+        # results saved without trial ids are matched by config
+        by_config = {"metric": "pr_auc", "best": {
+            **_CI, "config": self._trials()[1].config.to_dict()}}
+        self.assertIn("On the test patients",
+                      self._report(test=by_config).to_markdown())
+
+    def test_attribution_of_another_trial_is_labelled(self):
+        attribution = {"trial_id": 2, "reference": "the starting pipeline (#0)",
+                       "rows": [{"setting": "max_depth", "from": 4, "to": 6,
+                                 "contribution": 0.06, "se": 0.01,
+                                 "folds_better": 3, "score_without": 0.5}]}
+        text = self._report(attribution=attribution).to_markdown()
+        self.assertIn("contributed** to #2 (not the selected trial, #1)", text)
+        attribution["trial_id"] = 1
+        text = self._report(attribution=attribution).to_markdown()
+        self.assertIn("contributed** to #1, against", text)
+
+    def test_one_se_off_selects_the_top_candidate(self):
+        on, off = self._report(), self._report(one_se=False)
+        self.assertEqual((on.data["selected"], on.data["top"]), (1, 2))
+        self.assertEqual((off.data["selected"], off.data["top"]), (2, 2))
+        self.assertNotIn("Price of interpretability", off.to_markdown())
+
+    def test_xgboost_rung_uses_the_default_depth(self):
+        default, _ = self.SPACE.validate(PipelineConfig("XGBoost"))
+        self.assertEqual(default.model_params["max_depth"], 4)
+        # a config without max_depth is ranked as the model validate() builds
+        self.assertEqual(self.SPACE.rung(PipelineConfig("XGBoost")),
+                         self.SPACE.rung(default))
+        with mock.patch.object(space_module, "_XGB_DEPTH",
+                               Param("int", 1, 10, default=2)):
+            self.assertEqual(self.SPACE.rung(PipelineConfig("XGBoost")), 3)
+
+    def test_llm_text_is_escaped_in_html(self):
+        trials = self._trials()
+        trials[1].config.rationale = "<script>alert(1)</script> & more"
+        trials[1].config.hypothesis = {"expected": "<img src=x onerror=1>"}
+        report = self._report(trials, task="- <b>task</b>",
+                              lessons=["<iframe> lesson"])
+        page = report.to_html()
+        for raw in ("<script>", "<img", "<b>task", "<iframe>"):
+            self.assertNotIn(raw, page)
+        self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt; &amp; more", page)
+
+    def test_load_run_on_an_old_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # an old log: no run.json, no parent or change fields
+            with open(os.path.join(tmp, "trials.jsonl"), "w") as f:
+                for t in self._trials():
+                    data = t.to_dict()
+                    del data["parent"], data["change"]
+                    f.write(json.dumps(data) + "\n")
+            report = load_run(tmp, space=self.SPACE)
+            text = report.to_markdown()
+            self.assertEqual(report.data["selected"], 1)
+            self.assertIn("(inferred)", text)
+            self.assertIn("saved without run.json", text)
+            self.assertIn("**Selection rule.** Every trial is compared", text)
+            self.assertIn("most interpretable", report.data["rule"])
+
+            off = load_run(tmp, space=self.SPACE, one_se=False)
+            self.assertEqual(off.data["selected"], 2)
+            self.assertIn("the candidate with the highest bound", off.data["rule"])
+
+            # with run.json, its setting is used; overriding it is stated
+            with open(os.path.join(tmp, "run.json"), "w") as f:
+                json.dump({"metric": "pr_auc", "maximize": True, "promote_se": 1.0,
+                           "one_se": False, "rule": "the saved rule"}, f)
+            saved = load_run(tmp, space=self.SPACE)
+            self.assertEqual(saved.data["selected"], 2)
+            self.assertEqual((saved.data["rule"], saved.data["notes"]),
+                             ("the saved rule", []))
+            redone = load_run(tmp, space=self.SPACE, one_se=True)
+            self.assertEqual(redone.data["selected"], 1)
+            self.assertIn("re-selects with one_se=True", redone.to_markdown())
 
 
 class TestClaudeLLM(unittest.TestCase):
