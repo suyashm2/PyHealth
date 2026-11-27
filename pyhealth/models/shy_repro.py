@@ -43,7 +43,7 @@ from pyhealth.medcode import InnerMap
 from pyhealth.models import BaseModel
 
 
-class SHy(BaseModel):
+class SHyRepro(BaseModel):
     """Predict multi-label next-visit diagnoses from nested diagnosis histories.
 
     SHy (Yu et al., CHIL 2025) builds a hypergraph for each patient, with
@@ -102,7 +102,7 @@ class SHy(BaseModel):
 
     Examples:
         >>> from pyhealth.datasets import create_sample_dataset, get_dataloader
-        >>> from pyhealth.models import SHy
+        >>> from pyhealth.models import SHyRepro
         >>> samples = [
         ...     {
         ...         "patient_id": "patient-0",
@@ -123,7 +123,7 @@ class SHy(BaseModel):
         ...     output_schema={"next_conditions": "multilabel"},
         ...     dataset_name="test",
         ... )
-        >>> model = SHy(dataset=dataset, embedding_dim=32)
+        >>> model = SHyRepro(dataset=dataset, embedding_dim=32)
         >>> loader = get_dataloader(dataset, batch_size=2, shuffle=False)
         >>> output = model(**next(iter(loader)))
         >>> output["y_prob"].shape  # 2 patients, 3 possible next-visit codes

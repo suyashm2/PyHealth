@@ -15,7 +15,7 @@ By default the script uses PyHealth's public synthetic MIMIC-III data, so it
 runs without credentials. To use the real MIMIC-III 1.4 data, pass the folder
 that holds its CSV files:
 
-    python examples/mimic3_next_visit_diagnosis_shy.py \\
+    python examples/mimic3_next_visit_diagnosis_shy_repro.py \\
         --root /path/to/mimic-iii/1.4
 
 Use --models to train only some of the models, for example --models shy.
@@ -23,7 +23,7 @@ Use --models to train only some of the models, for example --models shy.
 Settings for SHy on real MIMIC-III (the default learning rate of 1e-3 is too
 high for SHy there and makes training unstable):
 
-    python examples/mimic3_next_visit_diagnosis_shy.py \\
+    python examples/mimic3_next_visit_diagnosis_shy_repro.py \\
         --root /path/to/mimic-iii/1.4 --models shy \\
         --embedding-dim 128 --hidden-dim 128 --batch-size 64 \\
         --learning-rate 3e-4 --max-grad-norm 5 --epochs 100 --patience 15
@@ -76,12 +76,12 @@ import torch
 
 from pyhealth.datasets import MIMIC3Dataset, get_dataloader, split_by_patient
 from pyhealth.models import RETAIN, RNN, Transformer
-from pyhealth.models import SHy
+from pyhealth.models import SHyRepro
 from pyhealth.tasks import NextVisitDiagnosisMIMIC3
 from pyhealth.trainer import Trainer
 
 SYNTHETIC_MIMIC3_ROOT = "https://storage.googleapis.com/pyhealth/Synthetic_MIMIC-III/"
-MODEL_CLASSES = {"rnn": RNN, "retain": RETAIN, "transformer": Transformer, "shy": SHy}
+MODEL_CLASSES = {"rnn": RNN, "retain": RETAIN, "transformer": Transformer, "shy": SHyRepro}
 TOP_K_VALUES = [10, 20]
 
 
@@ -309,7 +309,7 @@ def main() -> None:
 
         # STEP 4: train, keeping the epoch with the best validation PR-AUC
         if model_name == "shy":
-            model = SHy(
+            model = SHyRepro(
                 dataset=sample_dataset,
                 embedding_dim=args.embedding_dim,
                 hidden_dim=args.hidden_dim,

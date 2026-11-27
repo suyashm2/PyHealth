@@ -254,4 +254,4 @@ API Reference
     models/pyhealth.models.califorest
     models/pyhealth.models.XGBoostModel
     models/pyhealth.models.survival_mdn
-    models/pyhealth.models.shy
+    models/pyhealth.models.SHyRepro

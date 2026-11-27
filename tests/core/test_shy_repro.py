@@ -1,8 +1,8 @@
 """Small synthetic check for SHy's patient-isolated hypergraph construction.
 
 Run from this directory with either:
-    python test_shy.py
-    python -m pytest test_shy.py
+    python test_shy_repro.py
+    python -m pytest test_shy_repro.py
 
 These synthetic checks cover incidence construction, message passing,
 augmentation, phenotype extraction and embedding, prediction, and the four
@@ -13,13 +13,13 @@ or test ICD-9 hierarchy lookups.
 import torch
 import torch.nn as nn
 
-from pyhealth.models import SHy
+from pyhealth.models import SHyRepro
 
 
-def make_hypergraph_builder(num_nodes: int = 6) -> SHy:
+def make_hypergraph_builder(num_nodes: int = 6) -> SHyRepro:
     """Create just enough SHy state to call construct_initial_hypergraph."""
     # Bypass SHy.__init__: graph construction only needs these two attributes.
-    model = object.__new__(SHy)
+    model = object.__new__(SHyRepro)
     nn.Module.__init__(model)
     model.feature_key = "conditions"
     model.num_nodes = num_nodes
@@ -28,7 +28,7 @@ def make_hypergraph_builder(num_nodes: int = 6) -> SHy:
     return model
 
 
-def make_message_passing_model(num_nodes: int = 6) -> SHy:
+def make_message_passing_model(num_nodes: int = 6) -> SHyRepro:
     """Create a one-layer identity UniGIN update for transparent expected values."""
     model = make_hypergraph_builder(num_nodes)
     # Identity weights and zero epsilon make the update equal to:
@@ -39,7 +39,7 @@ def make_message_passing_model(num_nodes: int = 6) -> SHy:
     return model
 
 
-def make_augmentation_model(num_nodes: int = 7) -> SHy:
+def make_augmentation_model(num_nodes: int = 7) -> SHyRepro:
     """Create deterministic augmentation settings without loading a dataset."""
     model = make_hypergraph_builder(num_nodes)
     # Two original edges per patient and p=0.5 means exactly one new edge each.
@@ -51,7 +51,7 @@ def make_augmentation_model(num_nodes: int = 7) -> SHy:
     return model
 
 
-def make_phenotype_extraction_model(num_nodes: int = 7, num_phenotypes: int = 3) -> SHy:
+def make_phenotype_extraction_model(num_nodes: int = 7, num_phenotypes: int = 3) -> SHyRepro:
     """Create small independent mask MLPs for a synthetic extraction check."""
     model = make_hypergraph_builder(num_nodes)
     model.num_phenotypes = num_phenotypes
@@ -67,7 +67,7 @@ def make_phenotype_extraction_model(num_nodes: int = 7, num_phenotypes: int = 3)
     return model
 
 
-def make_temporal_embedding_model(embedding_dim: int = 2, hidden_dim: int = 3) -> SHy:
+def make_temporal_embedding_model(embedding_dim: int = 2, hidden_dim: int = 3) -> SHyRepro:
     """Create the GRU and temporal-attention modules without a real dataset."""
     model = make_hypergraph_builder(num_nodes=4)
     model.num_phenotypes = 2
@@ -85,7 +85,7 @@ def make_temporal_embedding_model(embedding_dim: int = 2, hidden_dim: int = 3) -
     return model
 
 
-def make_phenotype_prediction_model(prediction_activation: str) -> SHy:
+def make_phenotype_prediction_model(prediction_activation: str) -> SHyRepro:
     """Create small attention/classifier modules for Eq. 13–15 tests."""
     model = make_hypergraph_builder(num_nodes=4)
     model.hidden_dim = 2
@@ -119,7 +119,7 @@ def make_phenotype_prediction_model(prediction_activation: str) -> SHy:
     return model
 
 
-def make_loss_model() -> SHy:
+def make_loss_model() -> SHyRepro:
     """Build the tiny decoder/loss components without a dataset or ICD lookup."""
     model = make_hypergraph_builder(num_nodes=3)
     model.num_phenotypes = 2
