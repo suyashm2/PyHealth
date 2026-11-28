@@ -41,11 +41,11 @@ size 64 gives the same score (.3617 Recall@20, seed 42) in less time.
 | RNN, lr 1e-4 | .2581 | .4094 | .3509 | .3948 |
 | Transformer, lr 1e-4 | .2526 | .3987 | .3447 | .3860 |
 | RETAIN, lr 1e-4 | .2731 | .4332 | .3652 | .4135 |
-| RETAIN, lr 3e-4 (tuned) | .2871 | .4506 | .3816 | .4309 |
+| RETAIN, lr 3e-4, batch 8 (tuned) | .2871 | .4506 | .3816 | .4309 |
 
-The baselines use batch size 8 and early stopping on validation. For RETAIN
-we then tried several learning rates and picked 3e-4 on validation Recall@20,
-before looking at any test score:
+The baselines use batch size 8 and early stopping on validation. RETAIN was
+then tuned on validation Recall@20 (see "How RETAIN was tuned" below), before
+looking at any test score. The chosen settings are:
 
 ```
 python examples/mimic3_next_visit_diagnosis_shy_repro.py \
@@ -62,6 +62,51 @@ Findings:
   .3785 to .3838, so the two ranges do not overlap.
 - **Tuned RETAIN matches or beats the paper's SHy** on all four metrics. The
   paper reports RETAIN at .2958 Recall@20; ours reaches .3816 on our data.
+
+## How RETAIN was tuned
+
+All choices used validation Recall@20 only. The test patients were never used
+for a choice. Every run used Adam, up to 100 epochs and early stopping with
+patience 10. The tuning runs used a small separate script (not in this PR)
+with the same data, task, split and RETAIN model as the example script.
+
+**Step 1: learning rate and batch size.** One run each (seed 42), with
+embedding size 128, dropout 0.5 and no weight decay.
+
+| Learning rate | Batch 4 | Batch 8 | Batch 16 | Batch 32 |
+|---|---|---|---|---|
+| 1e-4 | .3804 | .3736 | .3621 | .3497 |
+| 3e-4 | .3873 | **.3916** | .3826 | .3769 |
+| 5e-4 | .3877 | .3908 | .3866 | .3850 |
+| 7e-4 | .3885 | .3914 | **.3932** | .3869 |
+| 1e-3 | .3881 | .3907 | .3905 | .3898 |
+
+Batch size 64 was also tried at two learning rates and was lower (.3630 at
+3e-4, .3781 at 1e-3).
+
+**Step 2: change one other setting.** One run each (seed 42), starting from
+lr 3e-4 at batch 8 (.3916). None of the changes helped.
+
+| Change | Recall@20 |
+|---|---|
+| Embedding size 64 | .3769 |
+| Embedding size 256 | .3823 |
+| Dropout 0.3 | .3726 |
+| Dropout 0.1 | .3361 |
+| Weight decay 1e-5 | .3377 |
+
+**3-seed check.** The two best cells of Step 1 are closer than the
+run-to-run noise, so both were run on 3 seeds.
+
+| Setting | Seed 42 | Seed 1 | Seed 2 | Mean |
+|---|---|---|---|---|
+| lr 3e-4, batch 8 | .3916 | .3957 | .3955 | **.3943** |
+| lr 7e-4, batch 16 | .3932 | .3907 | .3925 | .3921 |
+
+**Chosen:** lr 3e-4, batch 8, embedding size 128, dropout 0.5, no weight
+decay. Validation scores were used to choose the settings, so they run a
+little high (.3943). The test score in the table above (.3816) is the fair
+measure.
 
 ## Ablations (not in the paper)
 
