@@ -61,6 +61,8 @@ from .dipro import DiPro as DiPro
 from .daft import DAFT as DAFT, DAFTBlock as DAFTBlock, DAFTLayer as DAFTLayer
 from .maestro import MAESTRO as MAESTRO
 from .medfuse import MedFuse, MedFuseLayer
+from .ehr_cxr_early_fusion import EHRCXREarlyFusion as EHRCXREarlyFusion
+from .convirt import ConVIRT as ConVIRT, ConVIRTLinearProbe as ConVIRTLinearProbe
 from .medlink import MedLink
 from .micron import MICRON, MICRONLayer
 from .mlp import MLP
@@ -127,6 +129,7 @@ from .generators.synthea import Synthea as Synthea
 from .generators.corgan import CorGAN as CorGAN
 from .generators.tardiff import TarDiff as TarDiff
 from .survival_mdn import SurvivalMDN as SurvivalMDN
+from .mensa import MENSA as MENSA
 from .personalized_survival_moe import PersonalizedSurvivalMoE as PersonalizedSurvivalMoE
 from .cet import CET as CET
 from .trajsurv import TrajSurv as TrajSurv
@@ -165,6 +168,11 @@ from .descemb import (
     simple_word_tokenize as simple_word_tokenize,
 )
 from .bulk_rna_bert import BulkRNABert as BulkRNABert
+from .evicare import (
+    CooccurrenceGraph as CooccurrenceGraph,
+    EviCare as EviCare,
+    EviCarePrediction as EviCarePrediction,
+)
 from .dearllm import (
     DearLLM as DearLLM,
     DearLLMGraphEncoder as DearLLMGraphEncoder,
@@ -181,6 +189,13 @@ from .game import (
     init_embedding_with_game as init_embedding_with_game,
     load_game_embeddings as load_game_embeddings,
     normalize_game_code as normalize_game_code,
+)
+from .medtok import (
+    MedTokEmbedding as MedTokEmbedding,
+    apply_medtok as apply_medtok,
+    convert_medtok_embeddings as convert_medtok_embeddings,
+    load_medtok as load_medtok,
+    medtok_keys as medtok_keys,
 )
 from .query_focused_ehr import QueryFocusedEHRModel as QueryFocusedEHRModel
 from .shy_repro import SHyRepro as SHyRepro

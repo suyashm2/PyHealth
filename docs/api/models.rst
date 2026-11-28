@@ -336,6 +336,8 @@ API Reference
     models/pyhealth.models.Agent
     models/pyhealth.models.GRASP
     models/pyhealth.models.MedFuse
+    models/pyhealth.models.EHRCXREarlyFusion
+    models/pyhealth.models.ConVIRT
     models/pyhealth.models.MAESTRO
     models/pyhealth.models.DAFT
     models/pyhealth.models.DiPro
@@ -361,6 +363,7 @@ API Reference
     models/pyhealth.models.XGBoostModel
     models/pyhealth.models.survival_mdn
     models/pyhealth.models.personalized_survival_moe
+    models/pyhealth.models.MENSA
     models/pyhealth.models.cet
     models/pyhealth.models.TrajSurv
     models/pyhealth.models.KnowRare
@@ -378,6 +381,8 @@ API Reference
     models/pyhealth.models.DearLLM
     models/pyhealth.models.CHET
     models/pyhealth.models.GAME
+    models/pyhealth.models.MedTok
+    models/pyhealth.models.EviCare
     models/pyhealth.models.QueryFocusedEHRModel
     models/pyhealth.models.SHyRepro
 
